@@ -63,7 +63,7 @@ ollama --version
 ### Option 2: Build from source
 
 ```bash
-git clone <your-repo-url>
+git clone git@github.com:nachtschatt3n/ollama-guardian.git
 cd ollama-guardian
 swift build
 ./scripts/package-app.sh
