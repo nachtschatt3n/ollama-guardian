@@ -9,3 +9,4 @@ DerivedData/
 *.log
 *.tmp
 docs/screenshots/.DS_Store
+dist/
