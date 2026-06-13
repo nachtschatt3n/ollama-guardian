@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import SwiftUI
 import UserNotifications
 
@@ -7,6 +8,8 @@ final class GuardianController: ObservableObject {
     static let shared = GuardianController()
 
     @Published var config: GuardianConfig
+    @Published private(set) var savedConfig: GuardianConfig
+    @Published private(set) var appliedRuntimeConfig: GuardianConfig
     @Published var snapshot: GuardianSnapshot
     @Published var selectedSection: SidebarSection = .dashboard
     @Published var reloadHistory: [ReloadEvent] = []
@@ -22,23 +25,33 @@ final class GuardianController: ObservableObject {
     private var controlServer: LightweightHTTPServer?
     private var sampleTask: Task<Void, Never>?
     private var actionTask: Task<Void, Never>?
+    private var updateCheckTask: Task<Void, Never>?
     private var mutatingActionInFlight = false
     private var consecutiveHighCPUCount = 0
+
+    private static let releaseInfoDefaultsKey = "com.ollamaguardian.latestRelease"
+    private static let modelUpdatesDefaultsKey = "com.ollamaguardian.modelUpdates"
+    private static let updateCheckInterval: TimeInterval = 60 * 60 * 24
 
     init(settingsStore: SettingsStore = .shared) {
         self.settingsStore = settingsStore
         let loadedConfig = settingsStore.load()
         self.config = loadedConfig
+        self.savedConfig = loadedConfig
+        self.appliedRuntimeConfig = loadedConfig
         self.snapshot = .empty
         self.logger = FileLogger(path: loadedConfig.managedLogPath)
         self.backend = GuardianBackend(logger: logger)
         self.stateCache = SharedStateCache(config: loadedConfig, snapshot: .empty)
 
         snapshot.managedLogPath = config.managedLogPath
+        rehydrateUpdateCaches()
         stateCache.update(snapshot: snapshot)
         Task {
             await requestNotificationsIfNeeded()
             await bootstrap()
+            await maybeRunUpdateChecks()
+            startUpdateCheckLoop()
         }
     }
 
@@ -61,6 +74,22 @@ final class GuardianController: ObservableObject {
         return snapshot.api.healthy ? "Healthy" : "Unhealthy"
     }
 
+    var hasPendingRuntimeChanges: Bool {
+        savedConfig.runtimeSettings != appliedRuntimeConfig.runtimeSettings
+    }
+
+    var metricsEndpoint: String {
+        "http://\(savedConfig.metricsBindHost):\(savedConfig.metricsPort)/metrics"
+    }
+
+    var controlStatusEndpoint: String {
+        "http://\(savedConfig.controlBindHost):\(savedConfig.controlPort)/api/status"
+    }
+
+    var activeWarmModelSummary: String {
+        appliedRuntimeConfig.warmModels.map(\.name).joined(separator: ", ")
+    }
+
     func bootstrap() async {
         do {
             try await startManagedServices()
@@ -72,11 +101,18 @@ final class GuardianController: ObservableObject {
     func saveSettings() {
         do {
             try config.validate()
-            try settingsStore.save(config)
-            snapshot.managedLogPath = config.managedLogPath
-            reconfigureLoggingIfNeeded()
-            stateCache.update(config: config, snapshot: snapshot)
+            let newSavedConfig = config
+            try settingsStore.save(newSavedConfig)
+            savedConfig = newSavedConfig
+            stateCache.update(config: savedConfig, snapshot: snapshot)
             restartServers()
+
+            if hasPendingRuntimeChanges, promptToRestartForSavedSettings() {
+                runMutatingAction(name: "apply saved settings") { [weak self] in
+                    guard let self else { return }
+                    try await self.reloadOllama(trigger: .manual, message: "Applying saved settings")
+                }
+            }
         } catch {
             presentIssue(for: error, fallbackTitle: "Failed To Save Settings")
         }
@@ -88,7 +124,7 @@ final class GuardianController: ObservableObject {
     }
 
     func openLiveLogs() {
-        let escapedPath = config.managedLogPath.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedPath = appliedRuntimeConfig.managedLogPath.replacingOccurrences(of: "\"", with: "\\\"")
         let script = """
         tell application "Terminal"
             activate
@@ -118,7 +154,7 @@ final class GuardianController: ObservableObject {
     func warmModels() {
         runMutatingAction(name: "warm models") { [weak self] in
             guard let self else { return }
-            let currentConfig = await MainActor.run { self.config }
+            let currentConfig = await MainActor.run { self.appliedRuntimeConfig }
             try await self.backend.warmConfiguredModels(config: currentConfig)
         }
     }
@@ -128,12 +164,90 @@ final class GuardianController: ObservableObject {
         stateCache.update(snapshot: snapshot)
     }
 
+    func checkForUpdatesNow() {
+        Task { await runUpdateChecks(force: true) }
+    }
+
+    private func startUpdateCheckLoop() {
+        updateCheckTask?.cancel()
+        updateCheckTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60 * 60 * 6))
+                guard let self else { return }
+                await self.maybeRunUpdateChecks()
+            }
+        }
+    }
+
+    private func maybeRunUpdateChecks() async {
+        let now = Date()
+        let fetchedAt = snapshot.api.latestRelease?.fetchedAt
+        let modelsCheckedAt = snapshot.modelUpdates.map(\.checkedAt).min()
+        let releaseStale = fetchedAt.map { now.timeIntervalSince($0) >= Self.updateCheckInterval } ?? true
+        let modelsStale = modelsCheckedAt.map { now.timeIntervalSince($0) >= Self.updateCheckInterval } ?? true
+        guard releaseStale || modelsStale else { return }
+        await runUpdateChecks(force: false)
+    }
+
+    private func runUpdateChecks(force: Bool) async {
+        if let release = await backend.fetchLatestRelease() {
+            snapshot.api.latestRelease = release
+            persistReleaseInfo(release)
+        }
+
+        let installed = await backend.fetchInstalledDigests(config: appliedRuntimeConfig)
+        if !installed.isEmpty {
+            var statuses: [ModelUpdateStatus] = []
+            let now = Date()
+            for entry in installed {
+                let local = OllamaRegistryClient.normalizeDigest(entry.digest)
+                let remote = await backend.fetchRemoteDigest(model: entry.name)
+                statuses.append(ModelUpdateStatus(
+                    modelName: entry.name,
+                    localDigest: local,
+                    remoteDigest: remote.map(OllamaRegistryClient.normalizeDigest),
+                    checkedAt: now
+                ))
+            }
+            snapshot.modelUpdates = statuses
+            persistModelUpdates(statuses)
+        }
+
+        stateCache.update(snapshot: snapshot)
+        _ = force
+    }
+
+    private func rehydrateUpdateCaches() {
+        let defaults = UserDefaults.standard
+        let decoder = JSONDecoder()
+        if let data = defaults.data(forKey: Self.releaseInfoDefaultsKey),
+           let release = try? decoder.decode(OllamaReleaseInfo.self, from: data) {
+            snapshot.api.latestRelease = release
+        }
+        if let data = defaults.data(forKey: Self.modelUpdatesDefaultsKey),
+           let statuses = try? decoder.decode([ModelUpdateStatus].self, from: data) {
+            snapshot.modelUpdates = statuses
+        }
+    }
+
+    private func persistReleaseInfo(_ release: OllamaReleaseInfo) {
+        if let data = try? JSONEncoder().encode(release) {
+            UserDefaults.standard.set(data, forKey: Self.releaseInfoDefaultsKey)
+        }
+    }
+
+    private func persistModelUpdates(_ statuses: [ModelUpdateStatus]) {
+        if let data = try? JSONEncoder().encode(statuses) {
+            UserDefaults.standard.set(data, forKey: Self.modelUpdatesDefaultsKey)
+        }
+    }
+
     func recentLogLines(limit: Int) -> String {
         let lines = max(1, min(limit, 500))
-        guard let contents = try? String(contentsOfFile: config.managedLogPath, encoding: .utf8) else {
+        guard let contents = try? String(contentsOfFile: appliedRuntimeConfig.managedLogPath, encoding: .utf8) else {
             return ""
         }
-        let token = config.controlBearerToken
+        let token = savedConfig.controlBearerToken
         return contents
             .split(whereSeparator: \.isNewline)
             .suffix(lines)
@@ -165,9 +279,27 @@ final class GuardianController: ObservableObject {
         lines.append("# HELP ollama_guardian_ollama_resident_memory_bytes Ollama process RSS.")
         lines.append("# TYPE ollama_guardian_ollama_resident_memory_bytes gauge")
         lines.append("ollama_guardian_ollama_resident_memory_bytes \(current.process.residentMemoryBytes)")
-        lines.append("# HELP ollama_guardian_ollama_threads Ollama process thread count.")
-        lines.append("# TYPE ollama_guardian_ollama_threads gauge")
-        lines.append("ollama_guardian_ollama_threads \(current.process.threadCount)")
+        lines.append("# HELP ollama_guardian_requests_per_minute Completed Ollama requests in the last 60 seconds.")
+        lines.append("# TYPE ollama_guardian_requests_per_minute gauge")
+        lines.append("ollama_guardian_requests_per_minute \(current.requestRate.requestsPerMinute)")
+        lines.append("# HELP ollama_guardian_inflight_peak_60s Peak concurrent in-flight Ollama requests in the last 60 seconds.")
+        lines.append("# TYPE ollama_guardian_inflight_peak_60s gauge")
+        lines.append("ollama_guardian_inflight_peak_60s \(current.requestRate.peakConcurrencyLastMinute)")
+        lines.append("# HELP ollama_guardian_inflight_current Currently in-flight Ollama requests estimated from log timings.")
+        lines.append("# TYPE ollama_guardian_inflight_current gauge")
+        lines.append("ollama_guardian_inflight_current \(current.requestRate.currentInflightEstimate)")
+        lines.append("# HELP ollama_guardian_parallel_limit Loaded models multiplied by configured parallel slots.")
+        lines.append("# TYPE ollama_guardian_parallel_limit gauge")
+        lines.append("ollama_guardian_parallel_limit \(current.requestRate.parallelLimit)")
+        lines.append("# HELP ollama_guardian_model_update_available Whether a newer registry digest is available for a loaded model.")
+        lines.append("# TYPE ollama_guardian_model_update_available gauge")
+        for status in current.modelUpdates {
+            let escaped = status.modelName.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            lines.append("ollama_guardian_model_update_available{model=\"\(escaped)\"} \(status.updateAvailable ? 1 : 0)")
+        }
+        lines.append("# HELP ollama_guardian_ollama_update_available Whether a newer Ollama release is published on GitHub.")
+        lines.append("# TYPE ollama_guardian_ollama_update_available gauge")
+        lines.append("ollama_guardian_ollama_update_available \(current.api.updateAvailable ? 1 : 0)")
         lines.append("# HELP ollama_guardian_loaded_models Loaded Ollama models.")
         lines.append("# TYPE ollama_guardian_loaded_models gauge")
         lines.append("ollama_guardian_loaded_models \(current.loadedModelsCount)")
@@ -197,24 +329,25 @@ final class GuardianController: ObservableObject {
     }
 
     private func requestNotificationsIfNeeded() async {
-        guard config.notificationsEnabled else { return }
+        guard savedConfig.notificationsEnabled else { return }
         guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
     }
 
     private func startManagedServices() async throws {
-        try config.validate()
+        try savedConfig.validate()
         restartServers()
         startSamplingLoop()
-        let currentConfig = config
+        let currentConfig = savedConfig
         try await backend.startManagedProcess(config: currentConfig)
         let version = try await backend.waitForHealthyAPI(baseURL: currentConfig.resolvedOllamaBaseURL)
         snapshot.api.version = version
         snapshot.api.healthy = true
         snapshot.api.healthFailureStreak = 0
-        if config.keepWarmEnabled {
+        if currentConfig.keepWarmEnabled {
             try await backend.warmConfiguredModels(config: currentConfig)
         }
+        adoptAppliedRuntimeConfig(currentConfig)
         clearIssue(
             matchingTitles: [
                 "Install Ollama First",
@@ -231,7 +364,7 @@ final class GuardianController: ObservableObject {
         metricsServer?.stop()
         controlServer?.stop()
 
-        metricsServer = LightweightHTTPServer(host: config.metricsBindHost, port: UInt16(config.metricsPort), queueLabel: "ollama.guardian.metrics", logger: logger) { [weak self] request in
+        metricsServer = LightweightHTTPServer(host: savedConfig.metricsBindHost, port: UInt16(savedConfig.metricsPort), queueLabel: "ollama.guardian.metrics", logger: logger) { [weak self] request in
             guard let self else { return .text(status: "500 Internal Server Error", "missing controller\n") }
             if request.path == "/health" {
                 return .text("ok\n")
@@ -242,33 +375,40 @@ final class GuardianController: ObservableObject {
             return .text(status: "404 Not Found", "not found\n")
         }
 
-        controlServer = LightweightHTTPServer(host: config.controlBindHost, port: UInt16(config.controlPort), queueLabel: "ollama.guardian.control", logger: logger) { [weak self] request in
+        controlServer = LightweightHTTPServer(host: savedConfig.controlBindHost, port: UInt16(savedConfig.controlPort), queueLabel: "ollama.guardian.control", logger: logger) { [weak self] request in
             guard let self else { return .text(status: "500 Internal Server Error", "missing controller\n") }
             return self.handleControlRequest(request)
         }
 
+        var listenerIssue: UserFacingIssue?
         do {
             try metricsServer?.start()
         } catch {
+            listenerIssue = GuardianRuntimeError.listenerBindFailure(
+                service: "Metrics",
+                host: savedConfig.metricsBindHost,
+                port: savedConfig.metricsPort
+            ).userIssue
             presentIssue(
-                GuardianRuntimeError.listenerBindFailure(
-                    service: "Metrics",
-                    host: config.metricsBindHost,
-                    port: config.metricsPort
-                ).userIssue
+                listenerIssue!
             )
         }
 
         do {
             try controlServer?.start()
         } catch {
+            listenerIssue = GuardianRuntimeError.listenerBindFailure(
+                service: "Control API",
+                host: savedConfig.controlBindHost,
+                port: savedConfig.controlPort
+            ).userIssue
             presentIssue(
-                GuardianRuntimeError.listenerBindFailure(
-                    service: "Control API",
-                    host: config.controlBindHost,
-                    port: config.controlPort
-                ).userIssue
+                listenerIssue!
             )
+        }
+
+        if listenerIssue == nil {
+            clearIssue(matchingTitles: ["Metrics Port Is Busy", "Control API Port Is Busy"])
         }
     }
 
@@ -284,15 +424,18 @@ final class GuardianController: ObservableObject {
     }
 
     private func refreshSnapshot() async {
-        let currentConfig = config
-        let result = await backend.collectSample(config: currentConfig)
+        let runtimeConfig = appliedRuntimeConfig
+        let policyConfig = savedConfig
+        let result = await backend.collectSample(config: runtimeConfig)
 
         snapshot.system = result.system
         snapshot.process = result.process
+        snapshot.requestRate = result.requestRate
         appendMetricSamples(at: Date())
 
         if let version = result.version, let loadedModels = result.loadedModels {
-            snapshot.api = APIState(healthy: true, loadedModels: loadedModels, healthFailureStreak: 0, version: version)
+            let preservedRelease = snapshot.api.latestRelease
+            snapshot.api = APIState(healthy: true, loadedModels: loadedModels, healthFailureStreak: 0, version: version, latestRelease: preservedRelease)
         } else {
             snapshot.api.healthy = false
             snapshot.api.healthFailureStreak += 1
@@ -306,19 +449,19 @@ final class GuardianController: ObservableObject {
             snapshot.inference.degraded = true
         }
 
-        if snapshot.process.cpuPercent >= config.cpuThresholdPercent {
+        if snapshot.process.cpuPercent >= policyConfig.cpuThresholdPercent {
             consecutiveHighCPUCount += 1
         } else {
             consecutiveHighCPUCount = 0
         }
 
         let outcome = DetectionEngine.evaluate(
-            DetectionInput(snapshot: snapshot, config: config, now: Date(), consecutiveHighCPUCount: consecutiveHighCPUCount)
+            DetectionInput(snapshot: snapshot, config: policyConfig, now: Date(), consecutiveHighCPUCount: consecutiveHighCPUCount)
         )
         snapshot.stuckState = outcome.stuck
         stateCache.update(snapshot: snapshot)
 
-        if outcome.stuck, config.autoReloadEnabled {
+        if outcome.stuck, policyConfig.autoReloadEnabled {
             runMutatingAction(name: "auto reload") { [weak self] in
                 guard let self else { return }
                 try await self.reloadOllama(trigger: .stuck, message: outcome.reason ?? "Stuck state detected")
@@ -339,23 +482,24 @@ final class GuardianController: ObservableObject {
         }
 
         logger.write("reload requested trigger=\(trigger.rawValue) message=\(message)")
-        let currentConfig = config
+        let currentConfig = savedConfig
         try await backend.stopManagedProcess(force: true)
         try await backend.startManagedProcess(config: currentConfig)
         let version = try await backend.waitForHealthyAPI(baseURL: currentConfig.resolvedOllamaBaseURL)
         snapshot.api.version = version
         snapshot.api.healthy = true
         snapshot.api.healthFailureStreak = 0
-        if config.keepWarmEnabled {
+        if currentConfig.keepWarmEnabled {
             try await backend.warmConfiguredModels(config: currentConfig)
         }
+        adoptAppliedRuntimeConfig(currentConfig)
 
         let event = ReloadEvent(trigger: trigger, message: message)
         reloadHistory.insert(event, at: 0)
         snapshot.lastReloadTimestamp = event.timestamp
         snapshot.lastReloadReason = message
         snapshot.reloadCount += 1
-        snapshot.cooldownUntil = Date().addingTimeInterval(config.reloadCooldownSeconds)
+        snapshot.cooldownUntil = Date().addingTimeInterval(savedConfig.reloadCooldownSeconds)
         snapshot.stuckState = false
         clearIssue(
             matchingTitles: [
@@ -368,7 +512,7 @@ final class GuardianController: ObservableObject {
         )
         stateCache.update(snapshot: snapshot)
 
-        if config.notificationsEnabled, Bundle.main.bundleURL.pathExtension == "app" {
+        if savedConfig.notificationsEnabled, Bundle.main.bundleURL.pathExtension == "app" {
             sendNotification(title: "Ollama Guardian reloaded Ollama", body: message)
         }
     }
@@ -401,12 +545,14 @@ final class GuardianController: ObservableObject {
         UNUserNotificationCenter.current().add(request)
     }
 
-    private func reconfigureLoggingIfNeeded() {
-        guard logger.path != config.managedLogPath else { return }
-        let newLogger = FileLogger(path: config.managedLogPath)
-        logger = newLogger
-        snapshot.managedLogPath = config.managedLogPath
+    private func adoptAppliedRuntimeConfig(_ newConfig: GuardianConfig) {
+        appliedRuntimeConfig = newConfig
+        snapshot.managedLogPath = newConfig.managedLogPath
         stateCache.update(snapshot: snapshot)
+
+        guard logger.path != newConfig.managedLogPath else { return }
+        let newLogger = FileLogger(path: newConfig.managedLogPath)
+        logger = newLogger
         Task {
             await backend.setLogger(newLogger)
         }
@@ -448,6 +594,16 @@ final class GuardianController: ObservableObject {
             ]
         )
         presentIssue(issue)
+    }
+
+    private func promptToRestartForSavedSettings() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Restart Ollama to apply saved settings?"
+        alert.informativeText = "The updated runtime settings are saved. Restart Ollama now to load them, or keep the current runtime and apply them on the next restart."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restart Now")
+        alert.addButton(withTitle: "Later")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func appendMetricSamples(at timestamp: Date) {

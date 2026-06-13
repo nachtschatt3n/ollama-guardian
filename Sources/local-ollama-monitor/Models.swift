@@ -20,6 +20,32 @@ struct WarmModelConfig: Codable, Identifiable, Hashable {
     }
 }
 
+struct GuardianRuntimeSettings: Equatable {
+    var ollamaBaseURL: String
+    var ollamaHost: String
+    var ollamaPort: Int
+    var modelsDirectory: String
+    var allowedOrigins: String
+    var warmModels: [WarmModelConfig]
+    var keepAlive: Int
+    var contextLength: Int
+    var numParallel: Int
+    var maxQueue: Int
+    var maxLoadedModels: Int
+    var loadTimeout: String
+    var kvCacheType: String
+    var llmLibrary: String
+    var gpuOverheadBytes: String
+    var keepWarmEnabled: Bool
+    var debugEnabled: Bool
+    var flashAttentionEnabled: Bool
+    var noCloudEnabled: Bool
+    var noPruneEnabled: Bool
+    var schedSpreadEnabled: Bool
+    var multiUserCacheEnabled: Bool
+    var managedLogPath: String
+}
+
 struct GuardianConfig: Codable, Equatable {
     var ollamaBaseURL: String
     var ollamaHost: String
@@ -72,7 +98,7 @@ struct GuardianConfig: Codable, Equatable {
         controlBearerToken: UUID().uuidString.replacingOccurrences(of: "-", with: ""),
         warmModels: [
             WarmModelConfig(name: "gemma4:26b", endpointType: .generate),
-            WarmModelConfig(name: "gemma4:e2b", endpointType: .generate),
+            WarmModelConfig(name: "gemma4:e2b-mlx", endpointType: .generate),
             WarmModelConfig(name: "nomic-embed-text:latest", endpointType: .embed),
         ],
         keepAlive: -1,
@@ -252,6 +278,34 @@ struct GuardianConfig: Codable, Equatable {
     var resolvedOllamaBaseURL: URL {
         URL(string: ollamaBaseURL) ?? URL(string: "http://127.0.0.1:11434")!
     }
+
+    var runtimeSettings: GuardianRuntimeSettings {
+        GuardianRuntimeSettings(
+            ollamaBaseURL: ollamaBaseURL,
+            ollamaHost: ollamaHost,
+            ollamaPort: ollamaPort,
+            modelsDirectory: modelsDirectory,
+            allowedOrigins: allowedOrigins,
+            warmModels: warmModels,
+            keepAlive: keepAlive,
+            contextLength: contextLength,
+            numParallel: numParallel,
+            maxQueue: maxQueue,
+            maxLoadedModels: maxLoadedModels,
+            loadTimeout: loadTimeout,
+            kvCacheType: kvCacheType,
+            llmLibrary: llmLibrary,
+            gpuOverheadBytes: gpuOverheadBytes,
+            keepWarmEnabled: keepWarmEnabled,
+            debugEnabled: debugEnabled,
+            flashAttentionEnabled: flashAttentionEnabled,
+            noCloudEnabled: noCloudEnabled,
+            noPruneEnabled: noPruneEnabled,
+            schedSpreadEnabled: schedSpreadEnabled,
+            multiUserCacheEnabled: multiUserCacheEnabled,
+            managedLogPath: managedLogPath
+        )
+    }
 }
 
 struct SystemMetrics: Codable, Equatable {
@@ -268,10 +322,20 @@ struct ProcessMetrics: Codable, Equatable {
     var pid: Int32?
     var cpuPercent: Double
     var residentMemoryBytes: UInt64
-    var threadCount: Int
     var running: Bool
 
-    static let empty = ProcessMetrics(pid: nil, cpuPercent: 0, residentMemoryBytes: 0, threadCount: 0, running: false)
+    static let empty = ProcessMetrics(pid: nil, cpuPercent: 0, residentMemoryBytes: 0, running: false)
+}
+
+struct OllamaReleaseInfo: Codable, Equatable {
+    var latestTag: String
+    var publishedAt: Date
+    var htmlURL: URL
+    var fetchedAt: Date
+
+    var normalizedLatestVersion: String {
+        latestTag.hasPrefix("v") ? String(latestTag.dropFirst()) : latestTag
+    }
 }
 
 struct APIState: Codable, Equatable {
@@ -279,8 +343,56 @@ struct APIState: Codable, Equatable {
     var loadedModels: [String]
     var healthFailureStreak: Int
     var version: String
+    var latestRelease: OllamaReleaseInfo?
 
-    static let empty = APIState(healthy: false, loadedModels: [], healthFailureStreak: 0, version: "")
+    static let empty = APIState(healthy: false, loadedModels: [], healthFailureStreak: 0, version: "", latestRelease: nil)
+
+    var updateAvailable: Bool {
+        guard let release = latestRelease, !version.isEmpty else { return false }
+        return Self.semverCompare(release.normalizedLatestVersion, version) == .orderedDescending
+    }
+
+    static func semverCompare(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let lhsParts = lhs.split(separator: ".").compactMap { Int($0.prefix(while: \.isNumber)) }
+        let rhsParts = rhs.split(separator: ".").compactMap { Int($0.prefix(while: \.isNumber)) }
+        for index in 0..<max(lhsParts.count, rhsParts.count) {
+            let l = index < lhsParts.count ? lhsParts[index] : 0
+            let r = index < rhsParts.count ? rhsParts[index] : 0
+            if l < r { return .orderedAscending }
+            if l > r { return .orderedDescending }
+        }
+        return .orderedSame
+    }
+}
+
+struct RequestRateSnapshot: Codable, Equatable {
+    var requestsPerMinute: Int
+    var peakConcurrencyLastMinute: Int
+    var currentInflightEstimate: Int
+    var parallelLimit: Int
+    var perEndpointLastMinute: [String: Int]
+
+    static let empty = RequestRateSnapshot(
+        requestsPerMinute: 0,
+        peakConcurrencyLastMinute: 0,
+        currentInflightEstimate: 0,
+        parallelLimit: 0,
+        perEndpointLastMinute: [:]
+    )
+}
+
+struct ModelUpdateStatus: Codable, Equatable, Identifiable {
+    var modelName: String
+    var localDigest: String
+    var remoteDigest: String?
+    var checkedAt: Date
+
+    var id: String { modelName }
+
+    var updateAvailable: Bool {
+        guard let remote = remoteDigest, !remote.isEmpty, !localDigest.isEmpty else { return false }
+        return remote != localDigest
+    }
 }
 
 struct InferenceObservation: Codable, Equatable {
@@ -323,6 +435,8 @@ struct GuardianSnapshot: Codable, Equatable {
     var process: ProcessMetrics
     var api: APIState
     var inference: InferenceObservation
+    var requestRate: RequestRateSnapshot
+    var modelUpdates: [ModelUpdateStatus]
     var issue: UserFacingIssue?
     var reloadInProgress: Bool
     var stuckState: Bool
@@ -337,6 +451,8 @@ struct GuardianSnapshot: Codable, Equatable {
         process: .empty,
         api: .empty,
         inference: .empty,
+        requestRate: .empty,
+        modelUpdates: [],
         issue: nil,
         reloadInProgress: false,
         stuckState: false,

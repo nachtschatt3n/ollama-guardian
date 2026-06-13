@@ -8,8 +8,23 @@ struct OllamaPSResponse: Decodable {
     var models: [Model]
 }
 
+struct OllamaTagsResponse: Decodable {
+    struct Model: Decodable {
+        var name: String
+        var digest: String?
+    }
+
+    var models: [Model]
+}
+
 struct OllamaVersionResponse: Decodable {
     var version: String
+}
+
+struct GitHubRelease: Decodable {
+    var tag_name: String
+    var published_at: Date
+    var html_url: String
 }
 
 struct WarmGenerateRequest: Encodable {
@@ -31,6 +46,7 @@ struct SampleResult {
     var version: String?
     var loadedModels: [String]?
     var inference: InferenceObservation
+    var requestRate: RequestRateSnapshot
 }
 
 final class OllamaAPIClient: @unchecked Sendable {
@@ -60,6 +76,20 @@ final class OllamaAPIClient: @unchecked Sendable {
         }
     }
 
+    func installedModelsWithDigests(baseURL: URL) async -> [(name: String, digest: String)]? {
+        do {
+            let (data, response) = try await session.data(from: baseURL.appending(path: "/api/tags"))
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            let decoded = try JSONDecoder().decode(OllamaTagsResponse.self, from: data)
+            return decoded.models.compactMap { model in
+                guard let digest = model.digest, !digest.isEmpty else { return nil }
+                return (name: model.name, digest: digest)
+            }
+        } catch {
+            return nil
+        }
+    }
+
     func warm(model: WarmModelConfig, config: GuardianConfig) async throws {
         let url: URL
         let body: Data
@@ -83,6 +113,92 @@ final class OllamaAPIClient: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 90
         _ = try await session.data(for: request)
+    }
+}
+
+actor OllamaReleaseChecker {
+    private let session: URLSession
+    private let userAgent: String
+
+    init(session: URLSession = .shared, userAgent: String = "ollama-guardian") {
+        self.session = session
+        self.userAgent = userAgent
+    }
+
+    func latestRelease() async -> OllamaReleaseInfo? {
+        guard let url = URL(string: "https://api.github.com/repos/ollama/ollama/releases/latest") else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 15
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let release = try decoder.decode(GitHubRelease.self, from: data)
+            guard let htmlURL = URL(string: release.html_url) else { return nil }
+            return OllamaReleaseInfo(
+                latestTag: release.tag_name,
+                publishedAt: release.published_at,
+                htmlURL: htmlURL,
+                fetchedAt: Date()
+            )
+        } catch {
+            return nil
+        }
+    }
+}
+
+actor OllamaRegistryClient {
+    private let session: URLSession
+
+    init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    func remoteManifestDigest(model: String) async -> String? {
+        let (namespace, name, tag) = Self.parse(model: model)
+        guard let url = URL(string: "https://registry.ollama.ai/v2/\(namespace)/\(name)/manifests/\(tag)") else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.docker.distribution.manifest.v2+json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 15
+
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            let preferredHeaders: Set<String> = ["docker-content-digest", "ollama-content-digest"]
+            for (key, value) in http.allHeaderFields {
+                guard let keyString = key as? String else { continue }
+                if preferredHeaders.contains(keyString.lowercased()),
+                   let digestString = value as? String,
+                   !digestString.isEmpty {
+                    return Self.normalizeDigest(digestString)
+                }
+            }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    static func parse(model: String) -> (namespace: String, name: String, tag: String) {
+        let (path, tag): (String, String) = {
+            if let colon = model.lastIndex(of: ":") {
+                return (String(model[..<colon]), String(model[model.index(after: colon)...]))
+            }
+            return (model, "latest")
+        }()
+
+        if let slash = path.firstIndex(of: "/") {
+            return (String(path[..<slash]), String(path[path.index(after: slash)...]), tag)
+        }
+        return ("library", path, tag)
+    }
+
+    static func normalizeDigest(_ digest: String) -> String {
+        digest.hasPrefix("sha256:") ? String(digest.dropFirst("sha256:".count)) : digest
     }
 }
 
@@ -233,18 +349,19 @@ struct SampleCollector {
     }
 
     static func collectProcessMetrics() -> ProcessMetrics {
-        let output = (try? Shell.run("/bin/ps", arguments: ["-axo", "pid=,%cpu=,rss=,thcount=,comm="])) ?? ""
+        // macOS 26 dropped the `thcount` ps keyword; the old args returned exit 1 and 4-column
+        // rows, which the parser rejected — silently zeroing cpu/rss and disabling stuck detection.
+        let output = (try? Shell.run("/bin/ps", arguments: ["-axo", "pid=,%cpu=,rss=,comm="])) ?? ""
         let rows = output.split(whereSeparator: \.isNewline)
         for row in rows {
-            let parts = row.split(maxSplits: 4, whereSeparator: \.isWhitespace).filter { !$0.isEmpty }
-            guard parts.count >= 5 else { continue }
-            let command = String(parts[4])
+            let parts = row.split(maxSplits: 3, whereSeparator: \.isWhitespace).filter { !$0.isEmpty }
+            guard parts.count >= 4 else { continue }
+            let command = String(parts[3])
             guard command.contains("ollama") else { continue }
             return ProcessMetrics(
                 pid: Int32(parts[0]),
                 cpuPercent: Double(parts[1]) ?? 0,
                 residentMemoryBytes: (UInt64(parts[2]) ?? 0) * 1024,
-                threadCount: Int(parts[3]) ?? 0,
                 running: true
             )
         }
@@ -290,8 +407,23 @@ struct SampleCollector {
     }
 }
 
+struct LogScanResult {
+    var inference: InferenceObservation
+    var requestRate: RequestRateSnapshot
+}
+
+struct CompletedRequest: Equatable {
+    var endTime: Date
+    var latency: TimeInterval
+    var endpoint: String
+    var startTime: Date { endTime.addingTimeInterval(-latency) }
+}
+
 final class LogMonitor {
     private(set) var offset: UInt64 = 0
+    private var recentRequests: [CompletedRequest] = []
+    private static let bufferLimit = 400
+    private static let windowSeconds: TimeInterval = 60
     private let interestingEndpoints = [
         "/api/chat",
         "/api/generate",
@@ -301,38 +433,148 @@ final class LogMonitor {
         "/v1/models",
     ]
 
-    func scan(path: String) -> InferenceObservation {
+    func scan(path: String, parallelLimit: Int, now: Date = Date()) -> LogScanResult {
         guard FileManager.default.fileExists(atPath: path),
               let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
-            return InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: true)
+            return LogScanResult(
+                inference: InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: true),
+                requestRate: summarize(parallelLimit: parallelLimit, now: now)
+            )
         }
+
+        var degraded = false
+        var newEndpoint: String?
 
         do {
             try handle.seek(toOffset: offset)
             let data = try handle.readToEnd() ?? Data()
             offset += UInt64(data.count)
-            guard let chunk = String(data: data, encoding: .utf8), !chunk.isEmpty else {
-                return InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: false)
-            }
-
-            var lastEndpoint: String?
-            for line in chunk.split(whereSeparator: \.isNewline) {
-                if let endpoint = Self.extractEndpoint(from: String(line), matches: interestingEndpoints) {
-                    lastEndpoint = endpoint
+            if let chunk = String(data: data, encoding: .utf8), !chunk.isEmpty {
+                for line in chunk.split(whereSeparator: \.isNewline) {
+                    let lineString = String(line)
+                    if let completion = Self.parseGinCompletion(line: lineString, now: now) {
+                        recentRequests.append(completion)
+                        newEndpoint = completion.endpoint
+                    } else if let endpoint = Self.extractEndpoint(from: lineString, matches: interestingEndpoints) {
+                        newEndpoint = endpoint
+                    }
                 }
             }
-
-            if let lastEndpoint {
-                return InferenceObservation(lastInferenceTimestamp: Date(), lastInferenceEndpoint: lastEndpoint, degraded: false)
-            }
-            return InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: false)
         } catch {
-            return InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: true)
+            degraded = true
         }
+
+        pruneOldRequests(now: now)
+
+        let inference: InferenceObservation
+        if let endpoint = newEndpoint {
+            inference = InferenceObservation(lastInferenceTimestamp: now, lastInferenceEndpoint: endpoint, degraded: false)
+        } else {
+            inference = InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: degraded)
+        }
+
+        return LogScanResult(
+            inference: inference,
+            requestRate: summarize(parallelLimit: parallelLimit, now: now)
+        )
+    }
+
+    private func pruneOldRequests(now: Date) {
+        let cutoff = now.addingTimeInterval(-Self.windowSeconds)
+        recentRequests.removeAll { $0.endTime < cutoff }
+        if recentRequests.count > Self.bufferLimit {
+            recentRequests.removeFirst(recentRequests.count - Self.bufferLimit)
+        }
+    }
+
+    private func summarize(parallelLimit: Int, now: Date) -> RequestRateSnapshot {
+        let cutoff = now.addingTimeInterval(-Self.windowSeconds)
+        let window = recentRequests.filter { $0.endTime >= cutoff }
+        let rpm = window.count
+
+        var byEndpoint: [String: Int] = [:]
+        for req in window {
+            byEndpoint[req.endpoint, default: 0] += 1
+        }
+
+        let peakConcurrency = Self.maxOverlap(requests: window)
+        let currentInflight = window.filter { $0.startTime <= now && $0.endTime >= now }.count
+
+        return RequestRateSnapshot(
+            requestsPerMinute: rpm,
+            peakConcurrencyLastMinute: peakConcurrency,
+            currentInflightEstimate: currentInflight,
+            parallelLimit: max(0, parallelLimit),
+            perEndpointLastMinute: byEndpoint
+        )
+    }
+
+    static func maxOverlap(requests: [CompletedRequest]) -> Int {
+        guard !requests.isEmpty else { return 0 }
+        var events: [(time: Date, delta: Int)] = []
+        events.reserveCapacity(requests.count * 2)
+        for req in requests {
+            events.append((req.startTime, 1))
+            events.append((req.endTime, -1))
+        }
+        events.sort { a, b in
+            if a.time == b.time { return a.delta > b.delta }
+            return a.time < b.time
+        }
+        var current = 0
+        var peak = 0
+        for event in events {
+            current += event.delta
+            if current > peak { peak = current }
+        }
+        return peak
     }
 
     static func extractEndpoint(from line: String, matches endpoints: [String]) -> String? {
         endpoints.first(where: { line.contains($0) })
+    }
+
+    static func parseGinCompletion(line: String, now: Date) -> CompletedRequest? {
+        guard line.contains("[GIN]") else { return nil }
+        let parts = line.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count >= 5 else { return nil }
+
+        let statusField = parts[1]
+        guard Int(statusField) != nil else { return nil }
+
+        let latencyField = parts[2]
+        guard let latency = parseLatency(latencyField) else { return nil }
+
+        let methodPath = parts[4]
+        guard let endpoint = extractPath(from: methodPath) else { return nil }
+
+        return CompletedRequest(endTime: now, latency: latency, endpoint: endpoint)
+    }
+
+    static func parseLatency(_ raw: String) -> TimeInterval? {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        let suffixes: [(String, Double)] = [
+            ("µs", 1e-6),
+            ("us", 1e-6),
+            ("ms", 1e-3),
+            ("s", 1.0),
+        ]
+        for (suffix, multiplier) in suffixes where trimmed.hasSuffix(suffix) {
+            let valuePart = trimmed.dropLast(suffix.count)
+            if let value = Double(valuePart) {
+                return value * multiplier
+            }
+        }
+        return nil
+    }
+
+    static func extractPath(from methodPath: String) -> String? {
+        if let firstQuote = methodPath.firstIndex(of: "\""),
+           let closing = methodPath[methodPath.index(after: firstQuote)...].firstIndex(of: "\"") {
+            return String(methodPath[methodPath.index(after: firstQuote)..<closing])
+        }
+        let tokens = methodPath.split(whereSeparator: \.isWhitespace)
+        return tokens.last.map(String.init)
     }
 }
 
@@ -341,12 +583,24 @@ actor GuardianBackend {
     private let processManager: ManagedProcess
     private let apiClient: OllamaAPIClient
     private let logMonitor: LogMonitor
+    private let releaseChecker: OllamaReleaseChecker
+    private let registryClient: OllamaRegistryClient
 
     init(logger: FileLogger) {
         self.logger = logger
         self.processManager = ManagedProcess(logger: logger)
         self.apiClient = OllamaAPIClient()
         self.logMonitor = LogMonitor()
+        self.releaseChecker = OllamaReleaseChecker()
+        self.registryClient = OllamaRegistryClient()
+    }
+
+    func fetchLatestRelease() async -> OllamaReleaseInfo? {
+        await releaseChecker.latestRelease()
+    }
+
+    func fetchRemoteDigest(model: String) async -> String? {
+        await registryClient.remoteManifestDigest(model: model)
     }
 
     func setLogger(_ logger: FileLogger) {
@@ -383,19 +637,27 @@ actor GuardianBackend {
     }
 
     func collectSample(config: GuardianConfig) async -> SampleResult {
-        async let version = apiClient.version(baseURL: config.resolvedOllamaBaseURL)
-        async let loadedModels = apiClient.loadedModels(baseURL: config.resolvedOllamaBaseURL)
+        async let versionTask = apiClient.version(baseURL: config.resolvedOllamaBaseURL)
+        async let loadedModelsTask = apiClient.loadedModels(baseURL: config.resolvedOllamaBaseURL)
         let system = SampleCollector.collectSystemMetrics()
         let process = SampleCollector.collectProcessMetrics()
-        let inference = logMonitor.scan(path: config.managedLogPath)
+        let version = await versionTask
+        let loadedModels = await loadedModelsTask
+        let parallelLimit = max(1, (loadedModels?.count ?? 0)) * max(1, config.numParallel)
+        let scan = logMonitor.scan(path: config.managedLogPath, parallelLimit: parallelLimit)
 
         return SampleResult(
             system: system,
             process: process,
-            version: await version,
-            loadedModels: await loadedModels,
-            inference: inference
+            version: version,
+            loadedModels: loadedModels,
+            inference: scan.inference,
+            requestRate: scan.requestRate
         )
+    }
+
+    func fetchInstalledDigests(config: GuardianConfig) async -> [(name: String, digest: String)] {
+        await apiClient.installedModelsWithDigests(baseURL: config.resolvedOllamaBaseURL) ?? []
     }
 }
 

@@ -21,4 +21,16 @@ cp "${ROOT_DIR}/macos/Info.plist" "${CONTENTS_DIR}/Info.plist"
 cp "${ROOT_DIR}/.build/release/local-ollama-monitor" "${MACOS_DIR}/${EXECUTABLE_NAME}"
 chmod +x "${MACOS_DIR}/${EXECUTABLE_NAME}"
 
+if [ -f "${ROOT_DIR}/Sources/local-ollama-monitor/Resources/AppIcon.icns" ]; then
+  cp "${ROOT_DIR}/Sources/local-ollama-monitor/Resources/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
+fi
+
+find "${ROOT_DIR}/.build" -type d -name "*.bundle" -maxdepth 4 -print0 | while IFS= read -r -d '' bundle; do
+  cp -R "${bundle}" "${RESOURCES_DIR}/"
+done
+
+# Refresh the Finder's icon cache for the resulting bundle so the new icon
+# shows up immediately without a relogin.
+touch "${APP_DIR}" 2>/dev/null || true
+
 echo "${APP_DIR}"

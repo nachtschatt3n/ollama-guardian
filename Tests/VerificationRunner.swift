@@ -39,9 +39,11 @@ private func testDetectionTriggersOnHighCPUAndNoInference() throws {
     let config = GuardianConfig.default
     let snapshot = GuardianSnapshot(
         system: .empty,
-        process: ProcessMetrics(pid: 1, cpuPercent: 91, residentMemoryBytes: 1_024, threadCount: 12, running: true),
-        api: APIState(healthy: true, loadedModels: ["gemma4:26b"], healthFailureStreak: 0, version: "1.0.0"),
+        process: ProcessMetrics(pid: 1, cpuPercent: 91, residentMemoryBytes: 1_024, running: true),
+        api: APIState(healthy: true, loadedModels: ["gemma4:26b"], healthFailureStreak: 0, version: "1.0.0", latestRelease: nil),
         inference: InferenceObservation(lastInferenceTimestamp: Date().addingTimeInterval(-400), lastInferenceEndpoint: "/api/generate", degraded: false),
+        requestRate: .empty,
+        modelUpdates: [],
         issue: nil,
         reloadInProgress: false,
         stuckState: false,
@@ -63,9 +65,11 @@ private func testDetectionSkipsInferenceRuleWhenLogsAreDegraded() throws {
     let config = GuardianConfig.default
     let snapshot = GuardianSnapshot(
         system: .empty,
-        process: ProcessMetrics(pid: 1, cpuPercent: 91, residentMemoryBytes: 1_024, threadCount: 12, running: true),
-        api: APIState(healthy: true, loadedModels: ["gemma4:26b"], healthFailureStreak: 0, version: "1.0.0"),
+        process: ProcessMetrics(pid: 1, cpuPercent: 91, residentMemoryBytes: 1_024, running: true),
+        api: APIState(healthy: true, loadedModels: ["gemma4:26b"], healthFailureStreak: 0, version: "1.0.0", latestRelease: nil),
         inference: InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: true),
+        requestRate: .empty,
+        modelUpdates: [],
         issue: nil,
         reloadInProgress: false,
         stuckState: false,
@@ -139,6 +143,64 @@ private func testGuardianConfigValidationRejectsEmptyBearerToken() throws {
     }
 }
 
+private func testRuntimeSettingsIgnoreControlPlaneOnlyChanges() throws {
+    let applied = GuardianConfig.default
+    var saved = applied
+    saved.metricsPort += 1
+    saved.controlPort += 1
+    saved.controlBearerToken = "different-token"
+
+    try expect(saved.runtimeSettings == applied.runtimeSettings, "Runtime comparison should ignore metrics/control-only changes")
+
+    saved = applied
+    saved.ollamaPort += 1
+    try expect(saved.runtimeSettings != applied.runtimeSettings, "Runtime comparison should detect Ollama runtime changes")
+}
+
+private func testLogMonitorParsesGinCompletionLine() throws {
+    let now = Date()
+    let line = "[GIN] 2026/05/16 - 14:33:01 | 200 |   742.31ms |       127.0.0.1 | POST     \"/api/generate\""
+    let request = LogMonitor.parseGinCompletion(line: line, now: now)
+    try expect(request != nil, "gin completion line should be parsed")
+    try expect(request?.endpoint == "/api/generate", "gin endpoint should be /api/generate")
+    try expect((request?.latency ?? 0) > 0.7 && (request?.latency ?? 0) < 0.8, "gin latency should round-trip to ~0.742s")
+}
+
+private func testLogMonitorMaxOverlapComputesPeakConcurrency() throws {
+    let now = Date()
+    let requests: [CompletedRequest] = [
+        CompletedRequest(endTime: now.addingTimeInterval(-5), latency: 10, endpoint: "/api/generate"),
+        CompletedRequest(endTime: now.addingTimeInterval(-3), latency: 8, endpoint: "/api/generate"),
+        CompletedRequest(endTime: now.addingTimeInterval(-1), latency: 6, endpoint: "/api/generate"),
+    ]
+    let peak = LogMonitor.maxOverlap(requests: requests)
+    try expect(peak == 3, "All three intervals overlap — peak should be 3")
+}
+
+private func testOllamaRegistryParsesModelReferences() throws {
+    let (ns1, name1, tag1) = OllamaRegistryClient.parse(model: "llama3.2:1b")
+    try expect(ns1 == "library" && name1 == "llama3.2" && tag1 == "1b", "library/llama3.2:1b parse failed")
+    let (ns2, name2, tag2) = OllamaRegistryClient.parse(model: "mistral")
+    try expect(ns2 == "library" && name2 == "mistral" && tag2 == "latest", "default tag should be latest")
+    let (ns3, name3, tag3) = OllamaRegistryClient.parse(model: "myuser/my-model:custom")
+    try expect(ns3 == "myuser" && name3 == "my-model" && tag3 == "custom", "namespaced model parse failed")
+}
+
+private func testApiStateSemverCompareDetectsNewerRelease() throws {
+    var api = APIState.empty
+    api.version = "0.5.3"
+    api.latestRelease = OllamaReleaseInfo(
+        latestTag: "v0.5.4",
+        publishedAt: Date(),
+        htmlURL: URL(string: "https://example.com")!,
+        fetchedAt: Date()
+    )
+    try expect(api.updateAvailable, "v0.5.4 should be newer than 0.5.3")
+
+    api.version = "0.5.4"
+    try expect(!api.updateAvailable, "equal versions should not flag as update available")
+}
+
 private func testMissingOllamaIssueProvidesRecoverySteps() throws {
     let issue = GuardianRuntimeError.missingOllamaExecutable.userIssue
     try expect(issue.title == "Install Ollama First", "Missing Ollama issue should explain the install requirement")
@@ -157,7 +219,12 @@ enum VerificationRunner {
             ("Executable locator finds binaries in PATH", testExecutableLocatorFindsBinaryInSuppliedSearchPath),
             ("Config validation rejects invalid ports", testGuardianConfigValidationRejectsInvalidPort),
             ("Config validation rejects empty bearer tokens", testGuardianConfigValidationRejectsEmptyBearerToken),
+            ("Runtime settings ignore control-plane-only changes", testRuntimeSettingsIgnoreControlPlaneOnlyChanges),
             ("Missing Ollama issue includes install guidance", testMissingOllamaIssueProvidesRecoverySteps),
+            ("LogMonitor parses gin completion lines", testLogMonitorParsesGinCompletionLine),
+            ("LogMonitor max overlap computes peak concurrency", testLogMonitorMaxOverlapComputesPeakConcurrency),
+            ("Registry parses model references", testOllamaRegistryParsesModelReferences),
+            ("APIState semver compare detects newer releases", testApiStateSemverCompareDetectsNewerRelease),
         ]
 
         var failures: [String] = []

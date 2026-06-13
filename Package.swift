@@ -10,7 +10,10 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "local-ollama-monitor"
+            name: "local-ollama-monitor",
+            resources: [
+                .process("Resources")
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

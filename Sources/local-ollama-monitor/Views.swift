@@ -133,23 +133,38 @@ struct MainShellView: View {
         }
         .frame(minWidth: 1080, minHeight: 720)
         .background(
-            LinearGradient(
-                colors: [theme.canvasTop, theme.canvasBottom],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            ZStack {
+                LinearGradient(
+                    colors: [theme.canvasTop, theme.canvasBottom],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                GuardianBrandGraphic(variant: .watermark)
+                    .frame(width: 360, height: 490)
+                    .opacity(colorScheme == .dark ? 0.14 : 0.16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                    .padding(.trailing, 22)
+                    .padding(.top, 92)
+                .allowsHitTesting(false)
+            }
             .ignoresSafeArea()
         )
     }
 
     private var commandBar: some View {
         HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Ollama Guardian")
-                    .font(.system(size: 23, weight: .bold, design: .rounded))
-                Text(commandSubtitle)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 14) {
+                GuardianBrandGraphic(variant: .logo)
+                    .frame(width: 44, height: 44)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Ollama Guardian")
+                        .font(.system(size: 23, weight: .bold, design: .rounded))
+                    Text(commandSubtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Spacer()
@@ -159,6 +174,14 @@ struct MainShellView: View {
                 systemImage: guardian.snapshot.api.healthy ? "checkmark.circle.fill" : "exclamationmark.triangle.fill",
                 tint: guardian.snapshot.api.healthy ? theme.cpu : theme.danger
             )
+
+            if guardian.hasPendingRuntimeChanges {
+                StatusPill(
+                    title: "Restart Required",
+                    systemImage: "arrow.triangle.2.circlepath",
+                    tint: theme.gpu
+                )
+            }
 
             ActionButton(title: "Reload", systemImage: "arrow.clockwise") {
                 guardian.manualRestart()
@@ -257,8 +280,8 @@ struct SidebarView: View {
 
     private var sidebarFooterCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            LabeledSidebarValue(label: "Metrics", value: "http://\(guardian.config.metricsBindHost):\(guardian.config.metricsPort)/metrics")
-            LabeledSidebarValue(label: "Control API", value: "http://\(guardian.config.controlBindHost):\(guardian.config.controlPort)/api/status")
+            LabeledSidebarValue(label: "Metrics", value: guardian.metricsEndpoint)
+            LabeledSidebarValue(label: "Control API", value: guardian.controlStatusEndpoint)
 
             Divider()
                 .overlay(theme.sidebarMuted.opacity(0.28))
@@ -266,9 +289,21 @@ struct SidebarView: View {
             Text("Guardian \(Bundle.main.guardianVersionString)")
                 .font(.caption.monospaced())
                 .foregroundStyle(theme.sidebarSecondary)
-            Text("Ollama \(guardian.snapshot.api.version.nilIfEmpty ?? "—")")
-                .font(.caption.monospaced())
-                .foregroundStyle(theme.sidebarMuted)
+            HStack(spacing: 6) {
+                Text("Ollama \(guardian.snapshot.api.version.nilIfEmpty ?? "—")")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(theme.sidebarMuted)
+                if guardian.snapshot.api.updateAvailable, let release = guardian.snapshot.api.latestRelease {
+                    Text("→ \(release.latestTag)")
+                        .font(.caption2.monospaced().weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(theme.accent.opacity(0.22))
+                        .foregroundStyle(theme.accent)
+                        .clipShape(Capsule())
+                        .help("A newer Ollama release is available")
+                }
+            }
         }
         .padding(16)
         .background(Color.white.opacity(colorScheme == .dark ? 0.06 : 0.08))
@@ -313,7 +348,7 @@ struct DashboardPane: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
 
-                    Text("Warm set: \(guardian.config.warmModels.map(\.name).joined(separator: ", "))")
+                    Text("Warm set: \(guardian.activeWarmModelSummary)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -335,6 +370,10 @@ struct DashboardPane: View {
                             .frame(maxWidth: 260, alignment: .trailing)
                     }
                 }
+            }
+
+            if guardian.snapshot.api.updateAvailable, let release = guardian.snapshot.api.latestRelease {
+                OllamaUpdateBanner(release: release, installed: guardian.snapshot.api.version)
             }
 
             HStack(spacing: 14) {
@@ -374,9 +413,28 @@ struct DashboardPane: View {
     }
 
     private var summaryGrid: some View {
-        LazyVGrid(columns: [.init(.flexible()), .init(.flexible()), .init(.flexible())], spacing: 18) {
+        let rate = guardian.snapshot.requestRate
+        let queueValue = "\(rate.peakConcurrencyLastMinute) / \(max(rate.parallelLimit, 0))"
+        let queueDetail: String
+        let queueTint: Color?
+        if rate.parallelLimit == 0 {
+            queueDetail = "No loaded models"
+            queueTint = nil
+        } else if rate.peakConcurrencyLastMinute >= rate.parallelLimit {
+            queueDetail = "Saturated (last 60s)"
+            queueTint = theme.danger
+        } else if Double(rate.peakConcurrencyLastMinute) >= Double(rate.parallelLimit) * 0.8 {
+            queueDetail = "Concurrent (last 60s)"
+            queueTint = theme.gpu
+        } else {
+            queueDetail = "Concurrent (last 60s)"
+            queueTint = nil
+        }
+
+        return LazyVGrid(columns: [.init(.flexible()), .init(.flexible()), .init(.flexible())], spacing: 18) {
             MetricTile(title: "Ollama Memory", value: memoryString(guardian.snapshot.process.residentMemoryBytes), detail: "Resident memory footprint")
-            MetricTile(title: "Threads", value: "\(guardian.snapshot.process.threadCount)", detail: "Runner thread count")
+            MetricTile(title: "Requests / min", value: "\(rate.requestsPerMinute)", detail: "Completions in the last 60s")
+            MetricTile(title: "In-flight peak", value: queueValue, detail: queueDetail, accent: queueTint)
             MetricTile(title: "Loaded Models", value: "\(guardian.snapshot.loadedModelsCount)", detail: "From `/api/ps`")
             MetricTile(title: "Last Inference", value: guardian.snapshot.inference.lastInferenceTimestamp.map(DateFormatter.guardianShort.string(from:)) ?? "Never", detail: guardian.snapshot.inference.lastInferenceEndpoint ?? "No endpoint detected")
             MetricTile(title: "Last Reload", value: guardian.snapshot.lastReloadTimestamp.map(DateFormatter.guardianShort.string(from:)) ?? "Never", detail: guardian.snapshot.lastReloadReason ?? "No reloads yet")
@@ -392,12 +450,25 @@ struct DashboardPane: View {
             } else {
                 VStack(spacing: 10) {
                     ForEach(guardian.snapshot.api.loadedModels, id: \.self) { model in
+                        let status = guardian.snapshot.modelUpdates.first(where: { $0.modelName == model })
                         HStack {
                             Image(systemName: "cube.transparent.fill")
                                 .foregroundStyle(theme.accent)
                             Text(model)
                                 .font(.body.monospaced())
                             Spacer()
+                            if let status, status.updateAvailable, let remote = status.remoteDigest {
+                                let localShort = String(status.localDigest.prefix(12))
+                                let remoteShort = String(remote.prefix(12))
+                                Label("update", systemImage: "arrow.triangle.2.circlepath")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(theme.accent.opacity(0.16))
+                                    .foregroundStyle(theme.accent)
+                                    .clipShape(Capsule())
+                                    .help("Local \(localShort) → remote \(remoteShort)")
+                            }
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
@@ -412,8 +483,8 @@ struct DashboardPane: View {
     private var remoteOpsCard: some View {
         SurfaceCard(title: "Remote Observability", subtitle: "Network endpoints and control surfaces") {
             VStack(alignment: .leading, spacing: 12) {
-                LabeledValue(label: "Metrics", value: "http://\(guardian.config.metricsBindHost):\(guardian.config.metricsPort)/metrics")
-                LabeledValue(label: "Control", value: "http://\(guardian.config.controlBindHost):\(guardian.config.controlPort)/api/status")
+                LabeledValue(label: "Metrics", value: guardian.metricsEndpoint)
+                LabeledValue(label: "Control", value: guardian.controlStatusEndpoint)
                 Text("Prometheus can scrape over the network when Metrics Bind Host is `0.0.0.0` or your LAN IP. GPU is reported as whole-device utilization, which is a useful signal for Ollama on this Mac mini.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -1108,6 +1179,7 @@ struct MetricTile: View {
     var title: String
     var value: String
     var detail: String
+    var accent: Color? = nil
 
     private var theme: GuardianTheme { GuardianTheme(colorScheme: colorScheme) }
 
@@ -1118,11 +1190,12 @@ struct MetricTile: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.system(size: 20, weight: .bold, design: .rounded))
+                .foregroundStyle(accent ?? .primary)
                 .lineLimit(2)
                 .minimumScaleFactor(0.82)
             Text(detail)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(accent ?? .secondary)
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1130,7 +1203,7 @@ struct MetricTile: View {
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(theme.surfaceBorder, lineWidth: 1)
+                .stroke(accent?.opacity(0.45) ?? theme.surfaceBorder, lineWidth: 1)
         )
     }
 }
@@ -1273,5 +1346,53 @@ struct HelpLabel: View {
                 .foregroundStyle(.secondary)
         }
         .help(help)
+    }
+}
+
+struct OllamaUpdateBanner: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.openURL) private var openURL
+
+    var release: OllamaReleaseInfo
+    var installed: String
+
+    private var theme: GuardianTheme { GuardianTheme(colorScheme: colorScheme) }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.up.circle.fill")
+                .foregroundStyle(theme.accent)
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Ollama \(release.latestTag) is available")
+                    .font(.callout.weight(.semibold))
+                Text("Installed: \(installed.isEmpty ? "—" : installed) • Published \(DateFormatter.guardianShort.string(from: release.publishedAt))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                openURL(release.htmlURL)
+            } label: {
+                Label("Release notes", systemImage: "arrow.up.right.square")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(theme.accent.opacity(0.18))
+            .foregroundStyle(theme.accent)
+            .clipShape(Capsule())
+        }
+        .padding(14)
+        .background(theme.accent.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(theme.accent.opacity(0.35), lineWidth: 1)
+        )
     }
 }

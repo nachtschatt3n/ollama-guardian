@@ -60,11 +60,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let controlMenuItem = NSMenuItem(title: "Control API: --", action: nil, keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installApplicationIcon()
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
         configureMenu()
         bindGuardian()
         updateMenu()
+    }
+
+    private func installApplicationIcon() {
+        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let image = NSImage(contentsOf: url) {
+            NSApplication.shared.applicationIconImage = image
+        }
+    }
+
+    @objc private func showAboutPanel() {
+        let credits = NSMutableAttributedString(string: "github.com/nachtschatt3n/local-ollama-monitor", attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        if let url = URL(string: "https://github.com/nachtschatt3n/local-ollama-monitor") {
+            credits.addAttribute(.link, value: url, range: NSRange(location: 0, length: credits.length))
+        }
+
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [
+            .applicationName: "Ollama Guardian",
+            .credits: credits,
+        ]
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+            options[.applicationVersion] = version
+        }
+        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
+            options[.version] = build
+        }
+        if let copyright = Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String {
+            options[.init(rawValue: "Copyright")] = copyright
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
+
+    @objc private func checkForUpdates() {
+        guardian.checkForUpdatesNow()
     }
 
     @objc private func openDashboard() {
@@ -103,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureStatusItem() {
         if let button = statusItem.button {
             button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyUpOrDown
             button.title = ""
         }
         statusItem.menu = menu
@@ -143,6 +183,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
+        let aboutItem = NSMenuItem(title: "About Ollama Guardian", action: #selector(showAboutPanel), keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
+
+        let updatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        updatesItem.target = self
+        menu.addItem(updatesItem)
+
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -150,6 +198,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func bindGuardian() {
         guardian.$snapshot
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateMenu()
+            }
+            .store(in: &cancellables)
+
+        guardian.$savedConfig
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.updateMenu()
@@ -171,26 +226,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         modelsMenuItem.title = "Loaded models: \(snapshot.loadedModelsCount)"
         inferenceMenuItem.title = "Last inference: \(snapshot.inference.lastInferenceTimestamp.map(DateFormatter.guardianShort.string(from:)) ?? "Never")"
         reloadMenuItem.title = "Last reload: \(snapshot.lastReloadTimestamp.map(DateFormatter.guardianShort.string(from:)) ?? "Never")"
-        metricsMenuItem.title = "Metrics: http://\(guardian.config.metricsBindHost):\(guardian.config.metricsPort)/metrics"
-        controlMenuItem.title = "Control API: http://\(guardian.config.controlBindHost):\(guardian.config.controlPort)/api/status"
+        metricsMenuItem.title = "Metrics: \(guardian.metricsEndpoint)"
+        controlMenuItem.title = "Control API: \(guardian.controlStatusEndpoint)"
         updateStatusIcon()
     }
 
     private func updateStatusIcon() {
         guard let button = statusItem.button else { return }
-        let imageName: String
-        if guardian.snapshot.reloadInProgress {
-            imageName = "arrow.triangle.2.circlepath.circle.fill"
-        } else if guardian.snapshot.stuckState {
-            imageName = "exclamationmark.triangle.fill"
-        } else {
-            imageName = guardian.snapshot.api.healthy ? "cpu.fill" : "cpu"
-        }
-
-        let image = NSImage(systemSymbolName: imageName, accessibilityDescription: "Ollama Guardian")
-        image?.isTemplate = false
-        button.image = image
-        button.contentTintColor = guardian.snapshot.api.healthy ? .systemGreen : .secondaryLabelColor
+        button.image = GuardianBrandRenderer.trayImage()
+        button.contentTintColor = nil
     }
 }
 
