@@ -168,6 +168,10 @@ via [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) on Apple Silicon.
 
 Disable it entirely with the "Enable TTS Fallback" toggle in Settings.
 
+See [docs/tts-voice-tuning.md](docs/tts-voice-tuning.md) for the architecture rationale and
+the voice-tuning findings (model-variant choice, seed/temperature behavior, WSOLA pacing,
+and how to re-tune the voice).
+
 One-time host setup (in the configured TTS working directory):
 
 ```bash
