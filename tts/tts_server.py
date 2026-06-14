@@ -55,15 +55,18 @@ DEFAULT_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.7"))
 DEFAULT_TOP_K = int(os.environ.get("TTS_TOP_K", "50"))
 DEFAULT_TOP_P = float(os.environ.get("TTS_TOP_P", "1.0"))
 DEFAULT_REPETITION_PENALTY = float(os.environ.get("TTS_REPETITION_PENALTY", "1.05"))
-# Pitch-preserving time-stretch (WSOLA) applied AFTER synthesis. 1.0 = off. Values >1.0
-# speed up. 1.15 trims this voice's slightly-slow body pace (~76s -> ~66s on the sample).
-# WSOLA (overlap-add) is used instead of a phase vocoder because the latter smears
-# articulation into an "underwater/spacey" artifact.
+# Gentle high-shelf cut applied after synthesis: the 8-bit model is too bright/harsh
+# (spectral centroid ~3350 Hz vs the reference ~2740), which reads as "strong"
+# pronunciation. -4 dB above ~3500 Hz warms it toward the reference. 0 dB = off.
+DEFAULT_SOFTEN_DB = float(os.environ.get("TTS_SOFTEN_DB", "-4.0"))
+DEFAULT_SOFTEN_FC = float(os.environ.get("TTS_SOFTEN_FC", "3500.0"))
+# Pitch-preserving time-stretch applied AFTER synthesis. 1.0 = off. Values >1.0 speed up.
+# 1.15 trims this voice's slightly-slow pace (~76s -> ~66s on the sample). RubberBand
+# (formant-preserving) is used because WSOLA/phase-vocoder smear speech audibly.
 DEFAULT_SPEED = float(os.environ.get("TTS_SPEED", "1.15"))
-# The model synthesizes the opening greeting + date noticeably slower than the body, so
-# the first TTS_INTRO_SECONDS of audio get a stronger speed-up (ramped, with a short
-# crossfade into the body). Set TTS_INTRO_SPEED == TTS_SPEED to disable the ramp.
-DEFAULT_INTRO_SPEED = float(os.environ.get("TTS_INTRO_SPEED", "1.3"))
+# Optional stronger speed-up over the first TTS_INTRO_SECONDS (the model speaks the opening
+# greeting/date slowly), crossfaded into the body. Set == TTS_SPEED to disable (default).
+DEFAULT_INTRO_SPEED = float(os.environ.get("TTS_INTRO_SPEED", "1.15"))
 DEFAULT_INTRO_SECONDS = float(os.environ.get("TTS_INTRO_SECONDS", "15.0"))
 DEFAULT_INSTRUCT = os.environ.get(
     "TTS_INSTRUCT",
@@ -124,14 +127,36 @@ def _unload():
             pass
 
 
+def _soften(audio, sr, gain_db, fc):
+    # RBJ high-shelf biquad: attenuate highs above fc by gain_db to reduce the 8-bit
+    # model's harsh brightness. Deterministic, pitch-preserving.
+    if not gain_db:
+        return audio
+    import math
+    from scipy.signal import lfilter
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * math.pi * fc / sr
+    cw, sw = math.cos(w0), math.sin(w0)
+    alpha = sw / 2.0 * math.sqrt(2.0)  # shelf slope S=1
+    two_sqrtA_alpha = 2.0 * math.sqrt(A) * alpha
+    b0 = A * ((A + 1) + (A - 1) * cw + two_sqrtA_alpha)
+    b1 = -2 * A * ((A - 1) + (A + 1) * cw)
+    b2 = A * ((A + 1) + (A - 1) * cw - two_sqrtA_alpha)
+    a0 = (A + 1) - (A - 1) * cw + two_sqrtA_alpha
+    a1 = 2 * ((A - 1) - (A + 1) * cw)
+    a2 = (A + 1) - (A - 1) * cw - two_sqrtA_alpha
+    b = np.array([b0, b1, b2], dtype=np.float64) / a0
+    a = np.array([1.0, a1 / a0, a2 / a0], dtype=np.float64)
+    return lfilter(b, a, audio.astype(np.float64)).astype(np.float32)
+
+
 def _time_stretch(audio, rate):
-    # WSOLA overlap-add: preserves pitch AND articulation (no phase-vocoder smear).
-    from audiotsm import wsola
-    from audiotsm.io.array import ArrayReader, ArrayWriter
-    reader = ArrayReader(np.ascontiguousarray(audio.reshape(1, -1), dtype=np.float32))
-    writer = ArrayWriter(channels=1)
-    wsola(channels=1, speed=float(rate)).run(reader, writer)
-    return writer.data.reshape(-1).astype(np.float32)
+    # RubberBand (formant-preserving, --fine): the cleanest time-stretch for speech.
+    # WSOLA and phase vocoders both smear consonants audibly on this voice.
+    import pyrubberband as pyrb
+    out = pyrb.time_stretch(audio.astype(np.float32), _state["sr"], float(rate),
+                            rbargs={"-F": "", "--fine": ""})
+    return np.asarray(out, dtype=np.float32).reshape(-1)
 
 
 def _time_stretch_ramped(audio, sr, base_speed, intro_speed, intro_s):
@@ -172,6 +197,7 @@ def _worker():
                 )
             )
             audio = np.array(results[0].audio, dtype=np.float32).reshape(-1)
+            audio = _soften(audio, _state["sr"], DEFAULT_SOFTEN_DB, DEFAULT_SOFTEN_FC)
             if job["speed"] and job["speed"] != 1.0:
                 audio = _time_stretch_ramped(
                     audio, _state["sr"], job["speed"],
