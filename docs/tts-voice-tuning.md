@@ -114,7 +114,7 @@ back to the file defaults:
 | `TTS_SPEED` | 1.15 | body time-stretch (WSOLA); 1.0 = off |
 | `TTS_INTRO_SPEED` | 1.3 | first-`TTS_INTRO_SECONDS` time-stretch |
 | `TTS_INTRO_SECONDS` | 15 | length of the "intro" region |
-| `TTS_IDLE_UNLOAD_S` | 300 | unload model after this idle time |
+| `TTS_IDLE_UNLOAD_S` | 0 | 0 = keep model resident (low-latency, e.g. Home Assistant); >0 = unload after N idle seconds |
 | `TTS_TOP_K` / `TTS_TOP_P` / `TTS_REPETITION_PENALTY` | 50 / 1.0 / 1.05 | sampling |
 
 All are also per-request overridable on `POST /v1/audio/speech` (`speed`, `temperature`,

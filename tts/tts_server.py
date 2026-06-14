@@ -83,10 +83,12 @@ def _clean_text(text: str) -> str:
     # Qwen3-TTS has no SSML; strip tags (e.g. ElevenLabs <break time="0.7s"/>) so they
     # are not read aloud literally. Existing punctuation drives the prosody/pauses.
     return re.sub(r"\s+", " ", _SSML_RE.sub(" ", text)).strip()
-# Lazy-load + idle-unload: keep the GPU free for Ollama while idle (this is a rarely
-# used fallback). The model is loaded on the first synth request and released after
-# TTS_IDLE_UNLOAD_S seconds of inactivity.
-IDLE_UNLOAD_S = int(os.environ.get("TTS_IDLE_UNLOAD_S", "300"))
+# Lazy-load, then keep resident: the model loads on the FIRST synth request (so it never
+# collides with Ollama's boot-time warm-up, which previously caused a Metal OOM) and then
+# stays warm for low-latency interactive use (e.g. Home Assistant announcements).
+# TTS_IDLE_UNLOAD_S <= 0 means never unload; a positive value unloads after that many idle
+# seconds (frees ~3-4 GB GPU between uses, at the cost of a ~1s reload on the next request).
+IDLE_UNLOAD_S = int(os.environ.get("TTS_IDLE_UNLOAD_S", "0"))
 
 app = FastAPI(title="qwen3-tts-fallback")
 _jobs: "queue.Queue" = queue.Queue()
@@ -183,7 +185,7 @@ def _worker():
         try:
             job = _jobs.get(timeout=5)
         except queue.Empty:
-            if _state["loaded"] and (time.time() - _state["last_used"]) > IDLE_UNLOAD_S:
+            if IDLE_UNLOAD_S > 0 and _state["loaded"] and (time.time() - _state["last_used"]) > IDLE_UNLOAD_S:
                 _unload()
             continue
         try:
