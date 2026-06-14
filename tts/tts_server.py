@@ -35,6 +35,11 @@ from mlx_audio.audio_io import write as audio_write
 from mlx_audio.tts.utils import load_model
 import mlx.core as mx
 
+# audio_io shells out to bare "ffmpeg" for non-WAV output (mp3/opus). GUI-launched
+# processes (the Guardian-managed server) get a minimal PATH without /opt/homebrew/bin,
+# so make sure the Homebrew bins are reachable.
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
+
 MODEL_ID = os.environ.get("TTS_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit")
 # Voice pinned to match the ElevenLabs reference (low mature German female newsreader).
 # (seed, temperature) jointly select the voice and are CHAOTIC on this model — a 0.02
