@@ -60,7 +60,11 @@ struct TTSConfig: Codable, Equatable {
 
     static let defaultLogPath = "\(NSHomeDirectory())/Library/Application Support/OllamaGuardian/logs/tts.log"
     static let defaultWorkingDirectory = "\(NSHomeDirectory())/mlx-tts"
-    static let defaultInstruct = "A mature German woman around 45 years old. Calm, warm, lower-pitched and grounded newsreader voice, neutral standard High German (Hochdeutsch), composed and professional. NOT youthful, NOT high-pitched, no cute, no energetic anime tone."
+    // Voice tuned to the ElevenLabs reference (low mature German female newsreader).
+    // seed 99 + this instruct + the server's temperature 0.7 were grid-searched to match
+    // the reference's measured pitch (median F0 ~179 Hz). seed + instruct are passed to the
+    // server as env (TTS_SEED / TTS_INSTRUCT); keep them in sync with tts_server.py defaults.
+    static let defaultInstruct = "A mature German woman in her early fifties with a deep, low, warm chest voice. Calm, smooth, natural radio-news delivery at an easy flowing pace. Rich lower register, relaxed and grounded. Standard High German (Hochdeutsch). Not bright, not thin, not youthful, not high-pitched, not sing-songy, not slow."
 
     static let `default` = TTSConfig(
         enabled: true,
@@ -70,7 +74,7 @@ struct TTSConfig: Codable, Equatable {
         pythonPath: "\(defaultWorkingDirectory)/venv/bin/python",
         managedLogPath: defaultLogPath,
         model: "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
-        seed: 1234,
+        seed: 99,
         language: "german",
         instruct: defaultInstruct
     )

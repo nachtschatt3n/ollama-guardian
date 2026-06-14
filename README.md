@@ -172,7 +172,7 @@ One-time host setup (in the configured TTS working directory):
 
 ```bash
 python3 -m venv venv
-./venv/bin/pip install mlx-audio uvicorn fastapi webrtcvad-wheels
+./venv/bin/pip install mlx-audio uvicorn fastapi webrtcvad-wheels audiotsm
 cp /path/to/repo/tts/tts_server.py .   # reference copy is vendored in this repo
 # the Guardian launches: <venv>/bin/python -m uvicorn tts_server:app
 ```
