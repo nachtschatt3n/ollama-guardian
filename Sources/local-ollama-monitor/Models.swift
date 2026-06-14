@@ -46,6 +46,39 @@ struct GuardianRuntimeSettings: Equatable {
     var managedLogPath: String
 }
 
+struct TTSConfig: Codable, Equatable {
+    var enabled: Bool
+    var bindHost: String
+    var port: Int
+    var workingDirectory: String
+    var pythonPath: String
+    var managedLogPath: String
+    var model: String
+    var seed: Int
+    var language: String
+    var instruct: String
+
+    static let defaultLogPath = "\(NSHomeDirectory())/Library/Application Support/OllamaGuardian/logs/tts.log"
+    static let defaultWorkingDirectory = "\(NSHomeDirectory())/mlx-tts"
+    static let defaultInstruct = "A mature German woman around 45 years old. Calm, warm, lower-pitched and grounded newsreader voice, neutral standard High German (Hochdeutsch), composed and professional. NOT youthful, NOT high-pitched, no cute, no energetic anime tone."
+
+    static let `default` = TTSConfig(
+        enabled: true,
+        bindHost: "0.0.0.0",
+        port: 8000,
+        workingDirectory: defaultWorkingDirectory,
+        pythonPath: "\(defaultWorkingDirectory)/venv/bin/python",
+        managedLogPath: defaultLogPath,
+        model: "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
+        seed: 1234,
+        language: "german",
+        instruct: defaultInstruct
+    )
+
+    var healthURL: URL { URL(string: "http://127.0.0.1:\(port)/health")! }
+    var speechEndpoint: String { "http://\(bindHost):\(port)/v1/audio/speech" }
+}
+
 struct GuardianConfig: Codable, Equatable {
     var ollamaBaseURL: String
     var ollamaHost: String
@@ -81,6 +114,7 @@ struct GuardianConfig: Codable, Equatable {
     var schedSpreadEnabled: Bool
     var multiUserCacheEnabled: Bool
     var managedLogPath: String
+    var tts: TTSConfig
 
     static let defaultLogPath = "\(NSHomeDirectory())/Library/Application Support/OllamaGuardian/logs/ollama.log"
     static let defaultModelsDirectory = "\(NSHomeDirectory())/.ollama/models"
@@ -123,7 +157,8 @@ struct GuardianConfig: Codable, Equatable {
         noPruneEnabled: false,
         schedSpreadEnabled: false,
         multiUserCacheEnabled: false,
-        managedLogPath: defaultLogPath
+        managedLogPath: defaultLogPath,
+        tts: .default
     )
 
     enum CodingKeys: String, CodingKey {
@@ -161,6 +196,7 @@ struct GuardianConfig: Codable, Equatable {
         case schedSpreadEnabled
         case multiUserCacheEnabled
         case managedLogPath
+        case tts
     }
 
     init(
@@ -197,7 +233,8 @@ struct GuardianConfig: Codable, Equatable {
         noPruneEnabled: Bool,
         schedSpreadEnabled: Bool,
         multiUserCacheEnabled: Bool,
-        managedLogPath: String
+        managedLogPath: String,
+        tts: TTSConfig = .default
     ) {
         self.ollamaBaseURL = ollamaBaseURL
         self.ollamaHost = ollamaHost
@@ -233,6 +270,7 @@ struct GuardianConfig: Codable, Equatable {
         self.schedSpreadEnabled = schedSpreadEnabled
         self.multiUserCacheEnabled = multiUserCacheEnabled
         self.managedLogPath = managedLogPath
+        self.tts = tts
     }
 
     init(from decoder: Decoder) throws {
@@ -273,6 +311,7 @@ struct GuardianConfig: Codable, Equatable {
         schedSpreadEnabled = try container.decodeIfPresent(Bool.self, forKey: .schedSpreadEnabled) ?? fallback.schedSpreadEnabled
         multiUserCacheEnabled = try container.decodeIfPresent(Bool.self, forKey: .multiUserCacheEnabled) ?? fallback.multiUserCacheEnabled
         managedLogPath = try container.decodeIfPresent(String.self, forKey: .managedLogPath) ?? fallback.managedLogPath
+        tts = try container.decodeIfPresent(TTSConfig.self, forKey: .tts) ?? fallback.tts
     }
 
     var resolvedOllamaBaseURL: URL {
@@ -430,6 +469,30 @@ struct UserFacingIssue: Codable, Equatable, Identifiable {
     }
 }
 
+struct TTSState: Codable, Equatable {
+    var enabled: Bool
+    var running: Bool
+    var healthy: Bool
+    var pid: Int32?
+    var port: Int
+    var endpoint: String
+    var model: String
+    var lastError: String?
+    var restartCount: Int
+
+    static let empty = TTSState(
+        enabled: false,
+        running: false,
+        healthy: false,
+        pid: nil,
+        port: 8000,
+        endpoint: "",
+        model: "",
+        lastError: nil,
+        restartCount: 0
+    )
+}
+
 struct GuardianSnapshot: Codable, Equatable {
     var system: SystemMetrics
     var process: ProcessMetrics
@@ -437,6 +500,7 @@ struct GuardianSnapshot: Codable, Equatable {
     var inference: InferenceObservation
     var requestRate: RequestRateSnapshot
     var modelUpdates: [ModelUpdateStatus]
+    var tts: TTSState
     var issue: UserFacingIssue?
     var reloadInProgress: Bool
     var stuckState: Bool
@@ -453,6 +517,7 @@ struct GuardianSnapshot: Codable, Equatable {
         inference: .empty,
         requestRate: .empty,
         modelUpdates: [],
+        tts: .empty,
         issue: nil,
         reloadInProgress: false,
         stuckState: false,

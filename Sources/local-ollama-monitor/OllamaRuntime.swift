@@ -585,6 +585,8 @@ actor GuardianBackend {
     private let logMonitor: LogMonitor
     private let releaseChecker: OllamaReleaseChecker
     private let registryClient: OllamaRegistryClient
+    private let ttsProcess: TTSManagedProcess
+    private let ttsClient: TTSClient
 
     init(logger: FileLogger) {
         self.logger = logger
@@ -593,6 +595,8 @@ actor GuardianBackend {
         self.logMonitor = LogMonitor()
         self.releaseChecker = OllamaReleaseChecker()
         self.registryClient = OllamaRegistryClient()
+        self.ttsProcess = TTSManagedProcess(logger: logger)
+        self.ttsClient = TTSClient()
     }
 
     func fetchLatestRelease() async -> OllamaReleaseInfo? {
@@ -606,6 +610,38 @@ actor GuardianBackend {
     func setLogger(_ logger: FileLogger) {
         self.logger = logger
         processManager.logger = logger
+        ttsProcess.logger = logger
+    }
+
+    // MARK: - TTS fallback server
+
+    func startTTS(config: TTSConfig) throws {
+        try ttsProcess.start(config: config)
+    }
+
+    func stopTTS(force: Bool) throws {
+        try ttsProcess.stop(force: force)
+    }
+
+    var ttsRunning: Bool { ttsProcess.isRunning }
+    var ttsPid: Int32? { ttsProcess.pid }
+
+    func ttsHealth(config: TTSConfig) async -> TTSHealthResult {
+        await ttsClient.health(config: config)
+    }
+
+    /// Wait until the TTS server reports healthy (model loaded), or time out.
+    func waitForHealthyTTS(config: TTSConfig) async -> TTSHealthResult {
+        var last = TTSHealthResult(healthy: false, detail: "starting")
+        for _ in 0..<60 {
+            last = await ttsClient.health(config: config)
+            if last.healthy { return last }
+            if !ttsProcess.isRunning {
+                return TTSHealthResult(healthy: false, detail: "process exited during startup")
+            }
+            try? await Task.sleep(for: .seconds(2))
+        }
+        return last
     }
 
     func startManagedProcess(config: GuardianConfig) throws {

@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let reloadMenuItem = NSMenuItem(title: "Last reload: Never", action: nil, keyEquivalent: "")
     private let metricsMenuItem = NSMenuItem(title: "Metrics: --", action: nil, keyEquivalent: "")
     private let controlMenuItem = NSMenuItem(title: "Control API: --", action: nil, keyEquivalent: "")
+    private let ttsMenuItem = NSMenuItem(title: "TTS Fallback: --", action: nil, keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installApplicationIcon()
@@ -126,6 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guardian.warmModels()
     }
 
+    @objc private func restartTTSFallback() {
+        guardian.restartTTS()
+    }
+
     @objc private func clearCooldown() {
         guardian.clearCooldown()
     }
@@ -150,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureMenu() {
-        [statusMenuItem, apiMenuItem, modelsMenuItem, inferenceMenuItem, reloadMenuItem, metricsMenuItem, controlMenuItem].forEach {
+        [statusMenuItem, apiMenuItem, modelsMenuItem, inferenceMenuItem, reloadMenuItem, metricsMenuItem, controlMenuItem, ttsMenuItem].forEach {
             $0.isEnabled = false
             menu.addItem($0)
         }
@@ -176,6 +181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cooldownItem = NSMenuItem(title: "Clear Cooldown", action: #selector(clearCooldown), keyEquivalent: "")
         cooldownItem.target = self
         menu.addItem(cooldownItem)
+
+        let ttsRestartItem = NSMenuItem(title: "Restart TTS Fallback", action: #selector(restartTTSFallback), keyEquivalent: "")
+        ttsRestartItem.target = self
+        menu.addItem(ttsRestartItem)
 
         menu.addItem(.separator())
 
@@ -228,6 +237,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reloadMenuItem.title = "Last reload: \(snapshot.lastReloadTimestamp.map(DateFormatter.guardianShort.string(from:)) ?? "Never")"
         metricsMenuItem.title = "Metrics: \(guardian.metricsEndpoint)"
         controlMenuItem.title = "Control API: \(guardian.controlStatusEndpoint)"
+        let tts = snapshot.tts
+        let ttsStatus = !tts.enabled ? "Disabled" : (tts.healthy ? "Healthy" : (tts.running ? (tts.lastError == "loading" ? "Loading" : "Unhealthy") : "Down"))
+        ttsMenuItem.title = "TTS Fallback: \(ttsStatus)"
         updateStatusIcon()
     }
 

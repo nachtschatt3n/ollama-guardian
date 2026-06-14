@@ -330,11 +330,57 @@ struct DashboardPane: View {
                     loadedModelsCard
                     remoteOpsCard
                 }
+                ttsCard
                 reloadHistoryCard
             }
             .padding(24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var ttsCard: some View {
+        let tts = guardian.snapshot.tts
+        let statusTitle: String
+        let statusTint: Color
+        if !tts.enabled {
+            statusTitle = "Disabled"; statusTint = .secondary
+        } else if tts.healthy {
+            statusTitle = "Healthy"; statusTint = theme.cpu
+        } else if tts.running {
+            statusTitle = tts.lastError == "loading" ? "Loading model…" : "Starting / Unhealthy"
+            statusTint = theme.gpu
+        } else {
+            statusTitle = "Down"; statusTint = theme.danger
+        }
+        return SurfaceCard(title: "Local TTS Fallback", subtitle: "Self-hosted Qwen3-TTS used when ElevenLabs is over quota") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    StatusPill(
+                        title: statusTitle,
+                        systemImage: tts.healthy ? "waveform.circle.fill" : (tts.enabled ? "waveform.circle" : "minus.circle"),
+                        tint: statusTint
+                    )
+                    if let pid = tts.pid, tts.running {
+                        Text("PID \(String(pid))").font(.caption.monospaced()).foregroundStyle(.secondary)
+                    }
+                    if tts.restartCount > 0 {
+                        Text("restarts: \(tts.restartCount)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    ActionButton(title: "Restart", systemImage: "arrow.clockwise") {
+                        guardian.restartTTS()
+                    }
+                }
+                LabeledValue(label: "Endpoint", value: tts.endpoint.nilIfEmpty ?? "—")
+                LabeledValue(label: "Model", value: tts.model.nilIfEmpty ?? "—")
+                if let err = tts.lastError, err != "loading", !tts.healthy {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(theme.danger)
+                        .lineLimit(3)
+                }
+            }
+        }
     }
 
     private var heroCard: some View {
@@ -880,6 +926,36 @@ struct SettingsPane: View {
                                 }
                                 Spacer()
                             }
+                        }
+                    }
+                }
+
+                SurfaceCard(
+                    title: "Local TTS Fallback",
+                    subtitle: "Guardian-managed Qwen3-TTS (mlx-audio) used when ElevenLabs is unavailable. Changes apply on Save (the server restarts)."
+                ) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        settingToggle("Enable TTS Fallback", help: "When enabled, the guardian starts and supervises the local TTS server, restarting it if it crashes.", isOn: $guardian.config.tts.enabled)
+                        textSettingRow("Bind Host", help: "Address the TTS server listens on. Use 0.0.0.0 so the cluster can reach it.") {
+                            TextField("0.0.0.0", text: $guardian.config.tts.bindHost)
+                        }
+                        intTextSettingRow("Port", help: "TCP port for the OpenAI-compatible /v1/audio/speech endpoint.", value: $guardian.config.tts.port)
+                        textSettingRow("Working Directory", help: "Folder containing tts_server.py and the venv.") {
+                            TextField(TTSConfig.defaultWorkingDirectory, text: $guardian.config.tts.workingDirectory).font(.body.monospaced())
+                        }
+                        textSettingRow("Python Path", help: "The venv interpreter that has mlx-audio installed.") {
+                            TextField("python", text: $guardian.config.tts.pythonPath).font(.body.monospaced())
+                        }
+                        textSettingRow("Model", help: "mlx-community Qwen3-TTS model id served by the fallback.") {
+                            TextField("model", text: $guardian.config.tts.model).font(.body.monospaced())
+                        }
+                        textSettingRow("Language", help: "Spoken language passed to Qwen3-TTS (e.g. german).") {
+                            TextField("german", text: $guardian.config.tts.language)
+                        }
+                        intTextSettingRow("Voice Seed", help: "Fixed RNG seed that pins the VoiceDesign voice so it stays consistent day-to-day.", value: $guardian.config.tts.seed)
+                        textSettingRow("Voice Description", help: "VoiceDesign instruct describing the German voice character.") {
+                            TextField("voice description", text: $guardian.config.tts.instruct, axis: .vertical)
+                                .lineLimit(2...4)
                         }
                     }
                 }

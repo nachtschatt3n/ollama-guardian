@@ -16,6 +16,7 @@ swiftc \
   "${ROOT_DIR}/Sources/local-ollama-monitor/HTTPServer.swift" \
   "${ROOT_DIR}/Sources/local-ollama-monitor/Support.swift" \
   "${ROOT_DIR}/Sources/local-ollama-monitor/OllamaRuntime.swift" \
+  "${ROOT_DIR}/Sources/local-ollama-monitor/TTSRuntime.swift" \
   "${ROOT_DIR}/Tests/VerificationRunner.swift"
 
 "${RUNNER}"

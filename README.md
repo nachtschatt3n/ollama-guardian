@@ -4,6 +4,8 @@ Native macOS control plane for a local Ollama node.
 
 Ollama Guardian keeps a shared Ollama runtime healthy on macOS by monitoring the host, watching Ollama API/log activity, detecting stuck states, restarting and rewarming models when needed, exposing Prometheus metrics, and offering a small authenticated remote-ops API for automation or AI-SRE workflows.
 
+It also supervises a self-hosted **local TTS fallback** (Qwen3-TTS via mlx-audio) as a second managed process, checks daily for new Ollama releases and stale loaded-model digests, and tracks live request throughput — all surfaced in the dashboard, menu bar, and metrics.
+
 ## Screenshots
 
 ![Dashboard](docs/screenshots/dashboard.png)
@@ -12,11 +14,14 @@ Ollama Guardian keeps a shared Ollama runtime healthy on macOS by monitoring the
 
 ## What It Does
 
-- Runs as a menu bar app with a unified dashboard window.
+- Runs as a menu bar app (with a native app icon and About panel) and a unified dashboard window.
 - Manages `ollama serve` directly instead of relying on a wrapper proxy.
 - Monitors host CPU, Metal GPU utilization, memory, load average, Ollama process stats, API health, and log-derived inference activity.
+- Tracks live request throughput from the Ollama logs: requests/minute and peak in-flight concurrency vs. the parallel limit.
 - Detects likely stuck-runtime conditions and can reload Ollama automatically.
 - Warms a configurable model set after startup or reload.
+- Supervises a local **TTS fallback** server (Qwen3-TTS via mlx-audio) as a managed process: lazy model load, health polling, and automatic restart on crash.
+- Checks daily for a newer Ollama release (GitHub) and for stale loaded-model digests (Ollama registry), surfacing an in-app banner/badge and a "Check for Updates" action.
 - Exposes Prometheus metrics on a configurable network bind host and port.
 - Exposes a bearer-protected control API for restart, warmup, cooldown clearing, status, and recent logs.
 - Shows actionable recovery guidance instead of crashing when required runtime pieces are missing or misconfigured.
@@ -115,9 +120,18 @@ Key exported metrics include:
 - `ollama_guardian_ollama_resident_memory_bytes`
 - `ollama_guardian_loaded_models`
 - `ollama_guardian_api_healthy`
+- `ollama_guardian_requests_per_minute`
+- `ollama_guardian_inflight_peak_60s`
+- `ollama_guardian_parallel_limit`
 - `ollama_guardian_last_inference_timestamp_seconds`
 - `ollama_guardian_last_reload_timestamp_seconds`
 - `ollama_guardian_stuck_state`
+- `ollama_guardian_ollama_update_available`
+- `ollama_guardian_model_update_available{model="..."}`
+- `ollama_guardian_tts_enabled`
+- `ollama_guardian_tts_up`
+- `ollama_guardian_tts_healthy`
+- `ollama_guardian_tts_restart_total`
 
 ## Remote Control API
 
@@ -134,6 +148,37 @@ Available endpoints:
 - `POST /api/actions/warm`
 - `POST /api/actions/clear-cooldown`
 - `GET /api/logs/recent?lines=50`
+
+## Local TTS Fallback
+
+Ollama Guardian can supervise a self-hosted, German-capable text-to-speech server as a
+second managed process, used as a fallback when a primary cloud TTS (e.g. ElevenLabs) is
+unavailable. It runs [Qwen3-TTS](https://huggingface.co/collections/mlx-community/qwen3-tts)
+via [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) on Apple Silicon.
+
+- A small OpenAI-compatible server (`tts_server.py`, kept in the configured working
+  directory alongside its venv) exposes `POST /v1/audio/speech` and `GET /health`.
+- It **lazy-loads** the model on the first request and **unloads after idle**, so it does
+  not hold GPU memory while idle (avoiding contention with Ollama's resident models).
+- The voice is a fixed [VoiceDesign](https://huggingface.co/mlx-community) description with a
+  pinned seed, so output is reproducible day to day. Model, seed, language, and the voice
+  description are all configurable in Settings.
+- The Guardian starts it, polls `/health`, restarts it on crash, and reports status in the
+  dashboard card, the menu bar, and the `ollama_guardian_tts_*` metrics.
+
+Disable it entirely with the "Enable TTS Fallback" toggle in Settings.
+
+One-time host setup (in the configured TTS working directory):
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install mlx-audio uvicorn fastapi webrtcvad-wheels
+cp /path/to/repo/tts/tts_server.py .   # reference copy is vendored in this repo
+# the Guardian launches: <venv>/bin/python -m uvicorn tts_server:app
+```
+
+The server script is vendored at [`tts/tts_server.py`](tts/tts_server.py) for reference; the
+Guardian runs the copy in the configured working directory.
 
 ## Verification
 
@@ -160,23 +205,35 @@ That script compiles a standalone verification runner against the real runtime s
 ```text
 Sources/local-ollama-monitor/
   AppMain.swift
+  Branding.swift          # procedural app/menu-bar mascot + AppIcon source
   GuardianController.swift
   HTTPServer.swift
   Diagnostics.swift
   Models.swift
-  OllamaRuntime.swift
+  OllamaRuntime.swift      # Ollama process, log/RPM monitor, release + registry checks
+  TTSRuntime.swift         # managed TTS server process + health client
   SettingsStore.swift
   Support.swift
   Views.swift
+  Resources/
+    AppIcon.icns
+    guardian-brand-*.png
 
 scripts/
   package-app.sh
+  generate-app-icon.swift  # renders the mascot into AppIcon.iconset/.icns
   run-tests.sh
+
+tts/
+  tts_server.py            # OpenAI-compatible Qwen3-TTS fallback server (run on the host)
 
 docs/screenshots/
   dashboard.png
   live-logs.png
 ```
+
+`tts/tts_server.py` is a reference copy; at runtime the Guardian launches the copy in the
+configured TTS working directory (alongside its mlx-audio venv).
 
 ## License
 

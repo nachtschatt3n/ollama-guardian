@@ -28,6 +28,11 @@ final class GuardianController: ObservableObject {
     private var updateCheckTask: Task<Void, Never>?
     private var mutatingActionInFlight = false
     private var consecutiveHighCPUCount = 0
+    private var ttsHealthFailureStreak = 0
+    private var ttsRestartInFlight = false
+    private var lastTTSRestart: Date?
+    private var lastTTSStart: Date?
+    private static let ttsStartupGraceSeconds: TimeInterval = 45
 
     private static let releaseInfoDefaultsKey = "com.ollamaguardian.latestRelease"
     private static let modelUpdatesDefaultsKey = "com.ollamaguardian.modelUpdates"
@@ -96,16 +101,131 @@ final class GuardianController: ObservableObject {
         } catch {
             presentIssue(for: error, fallbackTitle: "Guardian Startup Failed")
         }
+        // TTS fallback server is supervised independently of Ollama: start it even
+        // if Ollama bootstrap failed, and let the sampling loop keep it healthy.
+        await startTTSIfEnabled()
+    }
+
+    func restartTTS() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.startTTSIfEnabled(forceRestart: true)
+        }
+    }
+
+    private func startTTSIfEnabled(forceRestart: Bool = false) async {
+        let cfg = savedConfig.tts
+        snapshot.tts.enabled = cfg.enabled
+        snapshot.tts.port = cfg.port
+        snapshot.tts.endpoint = cfg.speechEndpoint
+        snapshot.tts.model = cfg.model
+
+        guard cfg.enabled else {
+            if await backend.ttsRunning { try? await backend.stopTTS(force: true) }
+            snapshot.tts.running = false
+            snapshot.tts.healthy = false
+            snapshot.tts.pid = nil
+            stateCache.update(snapshot: snapshot)
+            return
+        }
+        if await backend.ttsRunning, !forceRestart {
+            stateCache.update(snapshot: snapshot)
+            return
+        }
+        do {
+            try await backend.startTTS(config: cfg)
+            lastTTSStart = Date()
+            ttsHealthFailureStreak = 0
+            snapshot.tts.running = await backend.ttsRunning
+            snapshot.tts.pid = await backend.ttsPid
+            snapshot.tts.lastError = nil
+            if forceRestart { snapshot.tts.restartCount += 1 }
+        } catch {
+            snapshot.tts.running = false
+            snapshot.tts.healthy = false
+            snapshot.tts.lastError = (error as? GuardianRuntimeError)?.userIssue.summary ?? error.localizedDescription
+            logger.write("tts start failed: \(snapshot.tts.lastError ?? "unknown")")
+        }
+        stateCache.update(snapshot: snapshot)
+    }
+
+    private func refreshTTS() async {
+        let cfg = savedConfig.tts
+        snapshot.tts.enabled = cfg.enabled
+        snapshot.tts.port = cfg.port
+        snapshot.tts.endpoint = cfg.speechEndpoint
+        snapshot.tts.model = cfg.model
+
+        guard cfg.enabled else {
+            if await backend.ttsRunning { try? await backend.stopTTS(force: true) }
+            snapshot.tts.running = false
+            snapshot.tts.healthy = false
+            snapshot.tts.pid = nil
+            ttsHealthFailureStreak = 0
+            stateCache.update(snapshot: snapshot)
+            return
+        }
+
+        let running = await backend.ttsRunning
+        snapshot.tts.running = running
+        snapshot.tts.pid = await backend.ttsPid
+
+        var loading = false
+        if running {
+            let health = await backend.ttsHealth(config: cfg)
+            snapshot.tts.healthy = health.healthy
+            if health.healthy {
+                snapshot.tts.lastError = nil
+            } else {
+                snapshot.tts.lastError = health.detail
+                loading = (health.detail == "loading")
+            }
+        } else {
+            snapshot.tts.healthy = false
+        }
+
+        // Restart only on a real crash, or sustained unhealthy *after* the startup
+        // grace window (the server needs a few seconds to bind + load the model, during
+        // which connection failures / "loading" are expected and must not trigger a restart).
+        let inGrace = lastTTSStart.map { Date().timeIntervalSince($0) < Self.ttsStartupGraceSeconds } ?? false
+        let crashed = !running
+        let unhealthyBeyondGrace = running && !snapshot.tts.healthy && !loading && !inGrace
+        let needsRestart = crashed || unhealthyBeyondGrace
+        ttsHealthFailureStreak = needsRestart ? ttsHealthFailureStreak + 1 : 0
+        let cooldownOK = lastTTSRestart.map { Date().timeIntervalSince($0) > 30 } ?? true
+        if ttsHealthFailureStreak >= 2, cooldownOK, !ttsRestartInFlight {
+            ttsRestartInFlight = true
+            lastTTSRestart = Date()
+            snapshot.tts.restartCount += 1
+            logger.write("auto-restarting tts (streak=\(ttsHealthFailureStreak) detail=\(snapshot.tts.lastError ?? "n/a"))")
+            do {
+                try await backend.startTTS(config: cfg)
+                lastTTSStart = Date()
+                snapshot.tts.lastError = nil
+            } catch {
+                snapshot.tts.lastError = (error as? GuardianRuntimeError)?.userIssue.summary ?? error.localizedDescription
+            }
+            ttsHealthFailureStreak = 0
+            ttsRestartInFlight = false
+        }
+        stateCache.update(snapshot: snapshot)
     }
 
     func saveSettings() {
         do {
             try config.validate()
+            let previousTTS = savedConfig.tts
             let newSavedConfig = config
             try settingsStore.save(newSavedConfig)
             savedConfig = newSavedConfig
             stateCache.update(config: savedConfig, snapshot: snapshot)
             restartServers()
+
+            // TTS launch parameters (model/seed/voice/paths/port) only take effect on a
+            // process restart; apply them when the TTS config changed.
+            if newSavedConfig.tts != previousTTS {
+                restartTTS()
+            }
 
             if hasPendingRuntimeChanges, promptToRestartForSavedSettings() {
                 runMutatingAction(name: "apply saved settings") { [weak self] in
@@ -324,6 +444,18 @@ final class GuardianController: ObservableObject {
         lines.append("# HELP ollama_guardian_health_failure_streak Consecutive failed health checks.")
         lines.append("# TYPE ollama_guardian_health_failure_streak gauge")
         lines.append("ollama_guardian_health_failure_streak \(current.api.healthFailureStreak)")
+        lines.append("# HELP ollama_guardian_tts_enabled Whether the local TTS fallback is enabled.")
+        lines.append("# TYPE ollama_guardian_tts_enabled gauge")
+        lines.append("ollama_guardian_tts_enabled \(current.tts.enabled ? 1 : 0)")
+        lines.append("# HELP ollama_guardian_tts_up Whether the managed TTS server process is running.")
+        lines.append("# TYPE ollama_guardian_tts_up gauge")
+        lines.append("ollama_guardian_tts_up \(current.tts.running ? 1 : 0)")
+        lines.append("# HELP ollama_guardian_tts_healthy Whether the TTS server reports healthy.")
+        lines.append("# TYPE ollama_guardian_tts_healthy gauge")
+        lines.append("ollama_guardian_tts_healthy \(current.tts.healthy ? 1 : 0)")
+        lines.append("# HELP ollama_guardian_tts_restart_total Times the guardian restarted the TTS server.")
+        lines.append("# TYPE ollama_guardian_tts_restart_total counter")
+        lines.append("ollama_guardian_tts_restart_total \(current.tts.restartCount)")
         lines.append("")
         return lines.joined(separator: "\n")
     }
@@ -471,6 +603,8 @@ final class GuardianController: ObservableObject {
         if snapshot.api.healthy, snapshot.process.running, snapshot.issue?.title == "Ollama API Did Not Come Up" {
             clearIssue()
         }
+
+        await refreshTTS()
     }
 
     private func reloadOllama(trigger: ReloadTrigger, message: String) async throws {
