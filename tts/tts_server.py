@@ -55,6 +55,20 @@ DEFAULT_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.7"))
 DEFAULT_TOP_K = int(os.environ.get("TTS_TOP_K", "50"))
 DEFAULT_TOP_P = float(os.environ.get("TTS_TOP_P", "1.0"))
 DEFAULT_REPETITION_PENALTY = float(os.environ.get("TTS_REPETITION_PENALTY", "1.05"))
+# Runaway guard. The model occasionally fails to emit end-of-speech and generates up to
+# its 4096-token ceiling (~327 s of audio for any input) — which makes one chunk take
+# ~100 s+ to synth and blows OpenClaw's say() budget, so the morning briefing silently
+# fails to deliver. Cap max_tokens proportional to input length: German speech runs
+# ~0.8-1.0 tokens/char on this 12.5 Hz model, so MAX_TOKENS_PER_CHAR=1.6 leaves ~60%
+# headroom (never truncates legit speech) while bounding a runaway to ~1.6x expected.
+DEFAULT_MAX_TOKENS_PER_CHAR = float(os.environ.get("TTS_MAX_TOKENS_PER_CHAR", "1.6"))
+DEFAULT_MAX_TOKENS_FLOOR = int(os.environ.get("TTS_MAX_TOKENS_FLOOR", "256"))
+DEFAULT_MAX_TOKENS_CEIL = int(os.environ.get("TTS_MAX_TOKENS_CEIL", "4096"))
+
+
+def _max_tokens_for(text):
+    n = int(len(text) * DEFAULT_MAX_TOKENS_PER_CHAR)
+    return max(DEFAULT_MAX_TOKENS_FLOOR, min(DEFAULT_MAX_TOKENS_CEIL, n))
 # Gentle high-shelf cut applied after synthesis: the 8-bit model is too bright/harsh
 # (spectral centroid ~3350 Hz vs the reference ~2740), which reads as "strong"
 # pronunciation. -4 dB above ~3500 Hz warms it toward the reference. 0 dB = off.
@@ -196,6 +210,7 @@ def _worker():
                     text=job["text"], language=job["lang"], instruct=job["instruct"],
                     temperature=job["temperature"], top_k=job["top_k"],
                     top_p=job["top_p"], repetition_penalty=job["repetition_penalty"],
+                    max_tokens=job["max_tokens"],
                 )
             )
             audio = np.array(results[0].audio, dtype=np.float32).reshape(-1)
@@ -255,6 +270,7 @@ def speech(req: SpeechRequest):
         "top_p": req.top_p if req.top_p is not None else DEFAULT_TOP_P,
         "repetition_penalty": req.repetition_penalty if req.repetition_penalty is not None else DEFAULT_REPETITION_PENALTY,
         "speed": req.speed if req.speed is not None else DEFAULT_SPEED,
+        "max_tokens": _max_tokens_for(text),
         "event": threading.Event(),
     }
     _jobs.put(job)
