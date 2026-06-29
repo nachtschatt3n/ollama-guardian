@@ -64,7 +64,7 @@ struct TTSConfig: Codable, Equatable {
     // seed 99 + this instruct + the server's temperature 0.7 were grid-searched to match
     // the reference's measured pitch (median F0 ~179 Hz). seed + instruct are passed to the
     // server as env (TTS_SEED / TTS_INSTRUCT); keep them in sync with tts_server.py defaults.
-    static let defaultInstruct = "A mature German woman in her early fifties with a deep, low, warm chest voice. Calm, smooth, natural radio-news delivery at an easy flowing pace. Rich lower register, relaxed and grounded. Standard High German (Hochdeutsch). Not bright, not thin, not youthful, not high-pitched, not sing-songy, not slow."
+    static let defaultInstruct = "A mature woman in her early fifties with a warm, low, calm voice. Professional native English radio-news presenter, clear neutral accent, relaxed natural pace. Not youthful, not high-pitched, not sing-songy."
 
     static let `default` = TTSConfig(
         enabled: true,
@@ -75,7 +75,7 @@ struct TTSConfig: Codable, Equatable {
         managedLogPath: defaultLogPath,
         model: "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
         seed: 99,
-        language: "german",
+        language: "english",
         instruct: defaultInstruct
     )
 

@@ -50,7 +50,7 @@ MODEL_ID = os.environ.get("TTS_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceD
 # down from ~237 Hz on the old voice. Do NOT drop temperature below ~0.65: at 0.5 the
 # model degenerates into minutes of looping audio.
 DEFAULT_SEED = int(os.environ.get("TTS_SEED", "99"))
-DEFAULT_LANG = os.environ.get("TTS_LANG", "german")
+DEFAULT_LANG = os.environ.get("TTS_LANG", "english")
 DEFAULT_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.7"))
 DEFAULT_TOP_K = int(os.environ.get("TTS_TOP_K", "50"))
 DEFAULT_TOP_P = float(os.environ.get("TTS_TOP_P", "1.0"))
@@ -84,18 +84,31 @@ DEFAULT_INTRO_SPEED = float(os.environ.get("TTS_INTRO_SPEED", "1.15"))
 DEFAULT_INTRO_SECONDS = float(os.environ.get("TTS_INTRO_SECONDS", "15.0"))
 DEFAULT_INSTRUCT = os.environ.get(
     "TTS_INSTRUCT",
-    "A mature German woman in her early fifties with a deep, low, warm chest voice. "
-    "Calm, smooth, natural radio-news delivery at an easy flowing pace. Rich lower "
-    "register, relaxed and grounded. Standard High German (Hochdeutsch). Not bright, "
-    "not thin, not youthful, not high-pitched, not sing-songy, not slow.",
+    "A mature woman in her early fifties with a warm, low, calm voice. Professional "
+    "native English radio-news presenter, clear neutral accent, relaxed natural pace. "
+    "Not youthful, not high-pitched, not sing-songy.",
 )
 _LANG_MAP = {"de": "german", "en": "english", "auto": "auto"}
 _SSML_RE = re.compile(r"<[^>]+>")
+
+# Speech normalization (default on; TTS_NORMALIZE=0 disables).
+#  - Drop bare digit runs >= TTS_DROP_DIGITS_MIN (tracking/order IDs the voice would spell
+#    digit-by-digit, which is long and useless aloud). Real amounts arrive already spelled
+#    out as words and are unaffected.
+NORMALIZE = os.environ.get("TTS_NORMALIZE", "1") != "0"
+DROP_DIGITS_MIN = int(os.environ.get("TTS_DROP_DIGITS_MIN", "7"))
+
+
+def _normalize_for_speech(text: str) -> str:
+    if not NORMALIZE:
+        return text
+    return re.sub(rf"\b\d{{{DROP_DIGITS_MIN},}}\b", " ", text)
 
 
 def _clean_text(text: str) -> str:
     # Qwen3-TTS has no SSML; strip tags (e.g. ElevenLabs <break time="0.7s"/>) so they
     # are not read aloud literally. Existing punctuation drives the prosody/pauses.
+    text = _normalize_for_speech(text)
     return re.sub(r"\s+", " ", _SSML_RE.sub(" ", text)).strip()
 # Lazy-load, then keep resident: the model loads on the FIRST synth request (so it never
 # collides with Ollama's boot-time warm-up, which previously caused a Metal OOM) and then
