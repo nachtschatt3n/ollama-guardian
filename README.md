@@ -19,7 +19,7 @@ It also supervises a self-hosted **local TTS fallback** (Qwen3-TTS via mlx-audio
 - Monitors host CPU, Metal GPU utilization, memory, load average, Ollama process stats, API health, and log-derived inference activity.
 - Tracks live request throughput from the Ollama logs: requests/minute and peak in-flight concurrency vs. the parallel limit.
 - Detects likely stuck-runtime conditions and can reload Ollama automatically.
-- Warms a configurable model set after startup or reload.
+- Warms a configurable model set after startup or reload (see [docs/ollama-model-setup.md](docs/ollama-model-setup.md) for the current model roster and rationale).
 - Supervises a local **TTS fallback** server (Qwen3-TTS via mlx-audio) as a managed process: lazy model load, health polling, and automatic restart on crash.
 - Checks daily for a newer Ollama release (GitHub) and for stale loaded-model digests (Ollama registry), surfacing an in-app banner/badge and a "Check for Updates" action.
 - Exposes Prometheus metrics on a configurable network bind host and port.
