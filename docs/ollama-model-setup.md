@@ -9,9 +9,9 @@ Last reviewed 2026-08-13.
 
 | Model | Role | Format | Context | Vision | Speed | Consumers |
 |---|---|---|---|---|---|---|
-| **`gemma4:26b`** | big / quality / **vision** — the everything-model | GGUF Q4_K_M | **131k** | ✅ | ~56 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
-| **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ❌ | ~120 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog |
-| **`nomic-embed-text:latest`** | embeddings | — | — | — | — | RAG: anythingllm, affine, nextcloud |
+| **`gemma4:26b`** | big / quality / **vision** — the everything-model | GGUF Q4_K_M | **131k** | ✅ | 57 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
+| **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ❌ | 163–193 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog |
+| **`nomic-embed-text:latest`** | embeddings | — | — | — | 39 ms/doc | RAG: anythingllm, affine, nextcloud |
 
 Plus **`qwen3-tts`** (mlx-audio VoiceDesign, `:8000`) for TTS — OpenClaw voice notes, Open
 WebUI read-aloud, HA announcements.
@@ -75,6 +75,31 @@ models that don't set one, which can surface repetition.
 Verified after the swap: discriminative image test (red→Red, green→Green), a tool call with
 correct name/args, the streaming wire format above, 768-dim embeddings, and all three models
 back to `Forever`.
+
+## Measured performance (0.32.9, 2026-08-13)
+Measured on the live host, so numbers carry some noise from real cluster traffic. Prefill was
+measured with a unique nonce at the head of each prompt — without it Ollama's prompt cache
+returns a near-zero prompt-eval duration and nonsensical throughput.
+
+| | `gemma4:26b` (GGUF) | `gemma4:e2b-mlx` (MLX) |
+|---|---|---|
+| Generation, prose | 56.5 tok/s | 162.8 tok/s |
+| Generation, code | 56.8 tok/s | 193.2 tok/s |
+| Prefill @ 1.8k tokens | 691 tok/s (2.7 s) | 3412 tok/s (0.5 s) |
+| Prefill @ 6k tokens | 656 tok/s (9.2 s) | 3495 tok/s (1.7 s) |
+| Prefill @ 20k tokens | 501 tok/s (40.8 s) | 3162 tok/s (6.5 s) |
+
+- Vision (`26b`, 768×768 image + 64 tokens out): **2.9 s** end to end.
+- Embeddings (`nomic`): **38.6 ms** single, **19.0 ms/doc** batched at 32 — batch where possible.
+- **The 26b is unchanged from the 0.31.1 baseline (~56 tok/s)**, as expected: the 0.32.x MLX and
+  MTP work does not touch the llama.cpp/GGUF path. The engine update was taken for correctness
+  and the MLX leak fix, not for GGUF speed.
+- The e2b-mlx figure is well above the ~120 tok/s this doc previously carried, but that older
+  number was not measured the same way — treat the gap as indicative, not as a measured 0.32.9
+  gain.
+- **Long prompts are the 26b's weak spot**: 20k tokens of input cost ~41 s before the first
+  token, and prefill throughput decays with length while the MLX model's stays flat. Route
+  bulk/long-context text work to `e2b-mlx` where quality allows.
 
 ## Log rotation
 The Guardian rotates `ollama.log` and `tts.log` at **64 MB, keeping 3 generations** (Settings →
