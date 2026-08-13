@@ -1,9 +1,9 @@
 # Ollama model setup (Mac mini)
 
-The local LLM setup this Guardian manages: **Ollama 0.31.1** on the Mac mini (Apple M4 Pro,
+The local LLM setup this Guardian manages: **Ollama 0.32.9** on the Mac mini (Apple M4 Pro,
 48 GB unified memory), serving `192.168.30.111:11434` to the home-lab cluster. A separate
 mlx-audio Qwen3-TTS server runs at `:8000` (see [tts-voice-tuning.md](tts-voice-tuning.md)).
-Last reviewed 2026-07-05.
+Last reviewed 2026-08-13.
 
 ## Model roster (3 models, all kept warm)
 
@@ -17,7 +17,9 @@ Plus **`qwen3-tts`** (mlx-audio VoiceDesign, `:8000`) for TTS — OpenClaw voice
 WebUI read-aloud, HA announcements.
 
 **Warm set** (Guardian `TTSConfig`/warm config, `keep_alive=-1`): all three Ollama models +
-the TTS model are pre-warmed and resident (~24.5 GB of models; ~46% memory free).
+the TTS model are pre-warmed and resident (~24 GB of models). The models fit comfortably; how
+much of the remaining 48 GB is free depends on what else the box is doing (agent processes and
+the ARAG Android emulator are the usual pressure, not Ollama).
 
 ## Runtime tuning
 - **KV cache `q8_0` + flash attention** on the GGUF path (`gemma4:26b`, `nomic`) — halves
@@ -57,9 +59,32 @@ Roster trimmed to the 3 models above (~23 GB) on 2026-07-05; removed 14 unused m
 (`gemma4:26b-mlx` test pull, GGUF `e2b`/`e4b`/`31b`, all `qwen3*` and `qwen3-vl*`,
 `gpt-oss:20b`, `text-embedding-3-small`, `allenporter/assist-llm`), freeing **~122 GB**.
 
+## Engine: 0.31.1 → 0.32.9 (2026-08-13)
+Taken for three changes that hit this setup directly:
+- **0.32.1** fixed a recurrent **MLX model cache leak** that grew memory across requests — the
+  exact shape of problem a `Forever`-pinned `e2b-mlx` accumulates over multi-week uptimes.
+- **0.32.1** improved **Gemma 4 tool calling** and multi-turn tool-response continuations.
+- **0.32.6** made `/v1/chat/completions` streaming match the OpenAI wire format (`role` only on
+  the first chunk, `finish_reason` on its own chunk, usage separate) and made truncated
+  responses report `finish_reason: "length"` instead of `"tool_calls"` — most cluster apps talk
+  to the OpenAI-compatible endpoint.
+
+Deliberately **not** on 0.32.10: it flips the `repeat_penalty` default from 1.1 to 1.0 (off) for
+models that don't set one, which can surface repetition.
+
+Verified after the swap: discriminative image test (red→Red, green→Green), a tool call with
+correct name/args, the streaming wire format above, 768-dim embeddings, and all three models
+back to `Forever`.
+
+## Log rotation
+The Guardian rotates `ollama.log` and `tts.log` at **64 MB, keeping 3 generations** (Settings →
+Server & Paths). It uses copy-truncate, not rename: the child processes hold their log
+descriptor for weeks, so a rename would leave them writing to the renamed inode. Added
+2026-08-13 after `ollama.log` reached 713 MB unbounded.
+
 ## Rollback / operational notes
-- **Engine rollback**: `/Applications/Ollama-0.30.8.app` backup exists (revert via the
-  0.24→0.30 runbook if ever needed).
+- **Engine rollback**: `/Applications/Ollama-0.31.1.app` (and `-0.30.8`, `-0.24.0`) backups
+  exist — quit the Guardian, swap `/Applications/Ollama.app`, relaunch.
 - The Guardian is the single server on `:11434`; its watchdog restarts `ollama serve` on the
   current binary if it's stopped.
 - Cluster apps reference the model by tag `gemma4:26b` (unchanged) — no app changes were
