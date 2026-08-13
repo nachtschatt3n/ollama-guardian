@@ -230,17 +230,9 @@ final class ManagedProcess: @unchecked Sendable {
         } catch {
             throw GuardianRuntimeError.failedToPrepareLogDirectory(path: logDirectory)
         }
-        if !FileManager.default.fileExists(atPath: config.managedLogPath) {
-            FileManager.default.createFile(atPath: config.managedLogPath, contents: nil)
-        }
 
-        let outputHandle: FileHandle
-        do {
-            outputHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: config.managedLogPath))
-        } catch {
-            throw GuardianRuntimeError.failedToOpenLogFile(path: config.managedLogPath)
-        }
-        try outputHandle.seekToEnd()
+        // Append mode, so LogRotator can truncate this file underneath the running child.
+        let outputHandle = try LogRotator.openAppendHandle(path: config.managedLogPath)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ollamaPath)
@@ -444,6 +436,14 @@ final class LogMonitor {
 
         var degraded = false
         var newEndpoint: String?
+
+        // A rotation truncates the file in place, so the byte offset we carry across scans can
+        // point past the new end. Detect that and re-read from the top, otherwise every later
+        // scan reads nothing and the request-rate metrics silently flatline.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber,
+           size.uint64Value < offset {
+            offset = 0
+        }
 
         do {
             try handle.seek(toOffset: offset)
@@ -672,6 +672,22 @@ actor GuardianBackend {
         }
     }
 
+    /// Keeps the two managed child-process logs from growing without bound. Cheap enough
+    /// (a `stat` per file) to run on every sampling tick; the copy only happens past the limit.
+    private func rotateManagedLogs(config: GuardianConfig) {
+        for path in [config.managedLogPath, config.tts.managedLogPath] {
+            let outcome = LogRotator.rotateIfNeeded(
+                path: path,
+                maxSizeMB: config.maxLogSizeMB,
+                maxFiles: config.maxLogFiles
+            )
+            if outcome.rotated {
+                let megabytes = outcome.bytesReclaimed / (1024 * 1024)
+                logger.write("rotated log \(path) at \(megabytes) MB (keeping \(config.maxLogFiles) generations)")
+            }
+        }
+    }
+
     func collectSample(config: GuardianConfig) async -> SampleResult {
         async let versionTask = apiClient.version(baseURL: config.resolvedOllamaBaseURL)
         async let loadedModelsTask = apiClient.loadedModels(baseURL: config.resolvedOllamaBaseURL)
@@ -680,6 +696,7 @@ actor GuardianBackend {
         let version = await versionTask
         let loadedModels = await loadedModelsTask
         let parallelLimit = max(1, (loadedModels?.count ?? 0)) * max(1, config.numParallel)
+        rotateManagedLogs(config: config)
         let scan = logMonitor.scan(path: config.managedLogPath, parallelLimit: parallelLimit)
 
         return SampleResult(

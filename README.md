@@ -22,6 +22,7 @@ It also supervises a self-hosted **local TTS fallback** (Qwen3-TTS via mlx-audio
 - Warms a configurable model set after startup or reload (see [docs/ollama-model-setup.md](docs/ollama-model-setup.md) for the current model roster and rationale).
 - Supervises a local **TTS fallback** server (Qwen3-TTS via mlx-audio) as a managed process: lazy model load, health polling, and automatic restart on crash.
 - Checks daily for a newer Ollama release (GitHub) and for stale loaded-model digests (Ollama registry), surfacing an in-app banner/badge and a "Check for Updates" action.
+- Rotates the managed Ollama and TTS logs by size (copy-truncate, so the running servers keep writing to the same file), keeping a configurable number of generations.
 - Exposes Prometheus metrics on a configurable network bind host and port.
 - Exposes a bearer-protected control API for restart, warmup, cooldown clearing, status, and recent logs.
 - Shows actionable recovery guidance instead of crashing when required runtime pieces are missing or misconfigured.
@@ -89,6 +90,7 @@ The Settings view exposes the practical Ollama server/runtime options for a guar
 - Ollama base URL, bind host, and port
 - model storage directory and allowed origins
 - keep-alive, context length, queueing, parallelism, and loaded-model limits
+- managed log path, log rotation size, and how many rotated generations to keep
 - load timeout, K/V cache type, LLM library override, and GPU overhead
 - flash attention, debug logging, prune/cloud toggles, spread scheduling, and multi-user cache
 - warm model list and endpoint type (`generate` or `embed`)
@@ -215,6 +217,7 @@ Sources/local-ollama-monitor/
   HTTPServer.swift
   Diagnostics.swift
   Models.swift
+  LogRotation.swift        # size-based copy-truncate rotation for the managed child logs
   OllamaRuntime.swift      # Ollama process, log/RPM monitor, release + registry checks
   TTSRuntime.swift         # managed TTS server process + health client
   SettingsStore.swift

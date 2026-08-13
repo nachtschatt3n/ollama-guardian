@@ -734,6 +734,17 @@ struct SettingsPane: View {
                                     TextField("Managed log path", text: $guardian.config.managedLogPath)
                                         .font(.body.monospaced())
                                 }
+                                intTextSettingRow(
+                                    "Max Log Size (MB)",
+                                    help: "Rotates the managed Ollama and TTS logs once they grow past this size. The current log is copied aside and truncated in place, so the running server keeps writing to it. Set to 0 to disable rotation.",
+                                    value: $guardian.config.maxLogSizeMB,
+                                    note: "0 disables rotation"
+                                )
+                                intTextSettingRow(
+                                    "Log Files Kept",
+                                    help: "How many rotated generations to keep alongside the live log (ollama.log.1 through .N). Older generations are deleted.",
+                                    value: $guardian.config.maxLogFiles
+                                )
                             }
                         }
 

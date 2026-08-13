@@ -118,10 +118,16 @@ struct GuardianConfig: Codable, Equatable {
     var schedSpreadEnabled: Bool
     var multiUserCacheEnabled: Bool
     var managedLogPath: String
+    var maxLogSizeMB: Int
+    var maxLogFiles: Int
     var tts: TTSConfig
 
     static let defaultLogPath = "\(NSHomeDirectory())/Library/Application Support/OllamaGuardian/logs/ollama.log"
     static let defaultModelsDirectory = "\(NSHomeDirectory())/.ollama/models"
+    /// Rotate the managed logs past this size; 0 disables rotation.
+    static let defaultMaxLogSizeMB = 64
+    /// How many rotated generations to keep (`ollama.log.1` … `.N`).
+    static let defaultMaxLogFiles = 3
 
     static let `default` = GuardianConfig(
         ollamaBaseURL: "http://127.0.0.1:11434",
@@ -162,6 +168,8 @@ struct GuardianConfig: Codable, Equatable {
         schedSpreadEnabled: false,
         multiUserCacheEnabled: false,
         managedLogPath: defaultLogPath,
+        maxLogSizeMB: defaultMaxLogSizeMB,
+        maxLogFiles: defaultMaxLogFiles,
         tts: .default
     )
 
@@ -200,6 +208,8 @@ struct GuardianConfig: Codable, Equatable {
         case schedSpreadEnabled
         case multiUserCacheEnabled
         case managedLogPath
+        case maxLogSizeMB
+        case maxLogFiles
         case tts
     }
 
@@ -238,6 +248,8 @@ struct GuardianConfig: Codable, Equatable {
         schedSpreadEnabled: Bool,
         multiUserCacheEnabled: Bool,
         managedLogPath: String,
+        maxLogSizeMB: Int = GuardianConfig.defaultMaxLogSizeMB,
+        maxLogFiles: Int = GuardianConfig.defaultMaxLogFiles,
         tts: TTSConfig = .default
     ) {
         self.ollamaBaseURL = ollamaBaseURL
@@ -274,6 +286,8 @@ struct GuardianConfig: Codable, Equatable {
         self.schedSpreadEnabled = schedSpreadEnabled
         self.multiUserCacheEnabled = multiUserCacheEnabled
         self.managedLogPath = managedLogPath
+        self.maxLogSizeMB = maxLogSizeMB
+        self.maxLogFiles = maxLogFiles
         self.tts = tts
     }
 
@@ -315,6 +329,8 @@ struct GuardianConfig: Codable, Equatable {
         schedSpreadEnabled = try container.decodeIfPresent(Bool.self, forKey: .schedSpreadEnabled) ?? fallback.schedSpreadEnabled
         multiUserCacheEnabled = try container.decodeIfPresent(Bool.self, forKey: .multiUserCacheEnabled) ?? fallback.multiUserCacheEnabled
         managedLogPath = try container.decodeIfPresent(String.self, forKey: .managedLogPath) ?? fallback.managedLogPath
+        maxLogSizeMB = try container.decodeIfPresent(Int.self, forKey: .maxLogSizeMB) ?? fallback.maxLogSizeMB
+        maxLogFiles = try container.decodeIfPresent(Int.self, forKey: .maxLogFiles) ?? fallback.maxLogFiles
         tts = try container.decodeIfPresent(TTSConfig.self, forKey: .tts) ?? fallback.tts
     }
 

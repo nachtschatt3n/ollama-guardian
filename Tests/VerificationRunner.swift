@@ -209,6 +209,83 @@ private func testMissingOllamaIssueProvidesRecoverySteps() throws {
     try expect(issue.recoverySteps.count >= 2, "Missing Ollama issue should include recovery steps")
 }
 
+private func testLogRotationTruncatesInPlaceAndKeepsGenerations() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ollama-guardian-rotation-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let path = directory.appendingPathComponent("ollama.log").path
+
+    // A writer holding an append handle stands in for the long-lived `ollama serve` child.
+    let handle = try LogRotator.openAppendHandle(path: path)
+    defer { try? handle.close() }
+    let megabyte = Data(repeating: 0x41, count: 1024 * 1024)
+    for _ in 0..<2 { try handle.write(contentsOf: megabyte) }
+
+    let belowLimit = LogRotator.rotateIfNeeded(path: path, maxSizeMB: 8, maxFiles: 2)
+    try expect(!belowLimit.rotated, "A 2 MB log should not rotate against an 8 MB limit")
+
+    let first = LogRotator.rotateIfNeeded(path: path, maxSizeMB: 1, maxFiles: 2)
+    try expect(first.rotated, "A 2 MB log should rotate against a 1 MB limit")
+
+    let liveSize = (try FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue ?? -1
+    try expect(liveSize == 0, "The live log should be truncated to zero, got \(liveSize) bytes")
+    try expect(
+        FileManager.default.fileExists(atPath: "\(path).1"),
+        "Rotation should leave the previous contents in ollama.log.1"
+    )
+
+    // The pre-existing append handle must keep writing into the same (now empty) inode rather
+    // than leaving a sparse gap — this is what O_APPEND buys us.
+    try handle.write(contentsOf: Data("after rotation\n".utf8))
+    let afterWrite = (try FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue ?? -1
+    try expect(afterWrite == 15, "Post-rotation writes should land at offset 0, got \(afterWrite) bytes")
+
+    // A second rotation shifts .1 to .2 and drops anything past maxFiles.
+    for _ in 0..<2 { try handle.write(contentsOf: megabyte) }
+    let second = LogRotator.rotateIfNeeded(path: path, maxSizeMB: 1, maxFiles: 2)
+    try expect(second.rotated, "The refilled log should rotate again")
+    try expect(
+        FileManager.default.fileExists(atPath: "\(path).2"),
+        "The older generation should have been shifted to ollama.log.2"
+    )
+    try expect(
+        !FileManager.default.fileExists(atPath: "\(path).3"),
+        "Rotation should not keep more generations than maxFiles"
+    )
+
+    let disabled = LogRotator.rotateIfNeeded(path: path, maxSizeMB: 0, maxFiles: 2)
+    try expect(!disabled.rotated, "maxSizeMB of 0 should disable rotation")
+}
+
+private func testLogMonitorRecoversAfterRotation() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ollama-guardian-monitor-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let path = directory.appendingPathComponent("ollama.log").path
+    let line = "[GIN] 2026/08/13 - 10:00:00 | 200 |     742.1ms |  192.168.30.20 | POST     \"/api/generate\"\n"
+
+    try Data(String(repeating: line, count: 3).utf8).write(to: URL(fileURLWithPath: path))
+    let monitor = LogMonitor()
+    let before = monitor.scan(path: path, parallelLimit: 1)
+    try expect(before.inference.lastInferenceTimestamp != nil, "The first scan should observe the request")
+    try expect(monitor.offset > 0, "The first scan should advance the read offset")
+
+    // Simulate the rotation: the file is truncated underneath the monitor, then the server writes
+    // fresh lines into it — so it is now shorter than the offset the monitor carried over.
+    try Data().write(to: URL(fileURLWithPath: path))
+    try Data(line.utf8).write(to: URL(fileURLWithPath: path))
+
+    let after = monitor.scan(path: path, parallelLimit: 1)
+    try expect(
+        after.inference.lastInferenceTimestamp != nil,
+        "The monitor should re-read from the top after truncation instead of flatlining"
+    )
+}
+
 @main
 enum VerificationRunner {
     static func main() {
@@ -227,6 +304,8 @@ enum VerificationRunner {
             ("LogMonitor max overlap computes peak concurrency", testLogMonitorMaxOverlapComputesPeakConcurrency),
             ("Registry parses model references", testOllamaRegistryParsesModelReferences),
             ("APIState semver compare detects newer releases", testApiStateSemverCompareDetectsNewerRelease),
+            ("Log rotation truncates in place and keeps generations", testLogRotationTruncatesInPlaceAndKeepsGenerations),
+            ("LogMonitor recovers after a rotation", testLogMonitorRecoversAfterRotation),
         ]
 
         var failures: [String] = []

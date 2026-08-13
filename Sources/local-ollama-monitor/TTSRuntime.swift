@@ -38,13 +38,8 @@ final class TTSManagedProcess: @unchecked Sendable {
             )
         }
 
-        let logDirectory = (config.managedLogPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: logDirectory, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: config.managedLogPath) {
-            FileManager.default.createFile(atPath: config.managedLogPath, contents: nil)
-        }
-        let outputHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: config.managedLogPath))
-        try outputHandle.seekToEnd()
+        // Append mode, so LogRotator can truncate this file underneath the running child.
+        let outputHandle = try LogRotator.openAppendHandle(path: config.managedLogPath)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: config.pythonPath)
