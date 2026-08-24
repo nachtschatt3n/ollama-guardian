@@ -268,11 +268,16 @@ private func testLogMonitorRecoversAfterRotation() throws {
     let path = directory.appendingPathComponent("ollama.log").path
     let line = "[GIN] 2026/08/13 - 10:00:00 | 200 |     742.1ms |  192.168.30.20 | POST     \"/api/generate\"\n"
 
-    try Data(String(repeating: line, count: 3).utf8).write(to: URL(fileURLWithPath: path))
+    // The first scan of a path only primes the offset, so start from an empty file and let the
+    // requests arrive afterwards — that is what a running monitor sees.
+    try Data().write(to: URL(fileURLWithPath: path))
     let monitor = LogMonitor()
+    _ = monitor.scan(path: path, parallelLimit: 1)
+
+    try Data(String(repeating: line, count: 3).utf8).write(to: URL(fileURLWithPath: path))
     let before = monitor.scan(path: path, parallelLimit: 1)
-    try expect(before.inference.lastInferenceTimestamp != nil, "The first scan should observe the request")
-    try expect(monitor.offset > 0, "The first scan should advance the read offset")
+    try expect(before.inference.lastInferenceTimestamp != nil, "The scan should observe the requests")
+    try expect(monitor.offset > 0, "The scan should advance the read offset")
 
     // Simulate the rotation: the file is truncated underneath the monitor, then the server writes
     // fresh lines into it — so it is now shorter than the offset the monitor carried over.
@@ -283,6 +288,37 @@ private func testLogMonitorRecoversAfterRotation() throws {
     try expect(
         after.inference.lastInferenceTimestamp != nil,
         "The monitor should re-read from the top after truncation instead of flatlining"
+    )
+}
+
+private func testLogMonitorDoesNotReplayHistoryOnStartup() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ollama-guardian-startup-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let path = directory.appendingPathComponent("ollama.log").path
+    let historical = "[GIN] 2026/08/24 - 09:00:00 | 200 |   742.31ms |  192.168.55.11 | POST     \"/api/generate\"\n"
+    // Stand-in for the weeks of history a live log accumulates between restarts.
+    try Data(String(repeating: historical, count: 500).utf8).write(to: URL(fileURLWithPath: path))
+
+    let monitor = LogMonitor()
+    let firstScan = monitor.scan(path: path, parallelLimit: 1)
+    try expect(
+        firstScan.requestRate.requestsPerMinute == 0,
+        "A fresh monitor must not replay the existing log, got \(firstScan.requestRate.requestsPerMinute)/min"
+    )
+    try expect(monitor.offset > 0, "The first scan should position at the end of the existing log")
+
+    // Anything appended afterwards is genuinely live and must be counted.
+    let handle = try LogRotator.openAppendHandle(path: path)
+    defer { try? handle.close() }
+    try handle.write(contentsOf: Data(historical.utf8))
+
+    let secondScan = monitor.scan(path: path, parallelLimit: 1)
+    try expect(
+        secondScan.requestRate.requestsPerMinute == 1,
+        "Requests appended after startup must count, got \(secondScan.requestRate.requestsPerMinute)/min"
     )
 }
 
@@ -300,9 +336,11 @@ private func testLogMonitorIgnoresGuardianPolling() throws {
     [GIN] 2026/08/24 - 20:30:22 | 200 |    1.740166ms |       127.0.0.1 | GET      "/api/ps"
 
     """
-    try Data(String(repeating: polling, count: 12).utf8).write(to: URL(fileURLWithPath: path))
-
+    try Data().write(to: URL(fileURLWithPath: path))
     let monitor = LogMonitor()
+    _ = monitor.scan(path: path, parallelLimit: 1)   // primes the offset
+
+    try Data(String(repeating: polling, count: 12).utf8).write(to: URL(fileURLWithPath: path))
     let pollingOnly = monitor.scan(path: path, parallelLimit: 1)
     try expect(
         pollingOnly.requestRate.requestsPerMinute == 0,
@@ -399,6 +437,7 @@ enum VerificationRunner {
             ("APIState semver compare detects newer releases", testApiStateSemverCompareDetectsNewerRelease),
             ("Log rotation truncates in place and keeps generations", testLogRotationTruncatesInPlaceAndKeepsGenerations),
             ("LogMonitor recovers after a rotation", testLogMonitorRecoversAfterRotation),
+            ("LogMonitor does not replay history on startup", testLogMonitorDoesNotReplayHistoryOnStartup),
             ("LogMonitor ignores guardian polling", testLogMonitorIgnoresGuardianPolling),
             ("Reaper finds orphaned runners only", testReaperFindsOrphanedRunnersOnly),
             ("Reaper rejects serve and foreign binaries", testReaperRejectsServeAndForeignBinaries),

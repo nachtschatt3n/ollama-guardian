@@ -438,6 +438,9 @@ struct CompletedRequest: Equatable {
 
 final class LogMonitor {
     private(set) var offset: UInt64 = 0
+    /// The log path this monitor has already positioned itself in. Until it matches, the next
+    /// scan starts at the end of the file rather than replaying its history.
+    private var primedPath: String?
     private var recentRequests: [CompletedRequest] = []
     private static let bufferLimit = 400
     private static let windowSeconds: TimeInterval = 60
@@ -461,12 +464,26 @@ final class LogMonitor {
 
         var degraded = false
         var newEndpoint: String?
+        let fileSize = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.uint64Value
+
+        // First sight of this log: start at the end. The file holds weeks of history, and
+        // request timestamps come from the scan time rather than the log line, so replaying it
+        // would present every historical request as if it had just completed — on startup that
+        // pinned requests_per_minute at the buffer cap for a full window.
+        if primedPath != path {
+            primedPath = path
+            offset = fileSize ?? 0
+            recentRequests.removeAll()
+            return LogScanResult(
+                inference: InferenceObservation(lastInferenceTimestamp: nil, lastInferenceEndpoint: nil, degraded: false),
+                requestRate: summarize(parallelLimit: parallelLimit, now: now)
+            )
+        }
 
         // A rotation truncates the file in place, so the byte offset we carry across scans can
         // point past the new end. Detect that and re-read from the top, otherwise every later
         // scan reads nothing and the request-rate metrics silently flatline.
-        if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber,
-           size.uint64Value < offset {
+        if let fileSize, fileSize < offset {
             offset = 0
         }
 
