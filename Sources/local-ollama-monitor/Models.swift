@@ -147,7 +147,10 @@ struct GuardianConfig: Codable, Equatable {
         ],
         keepAlive: -1,
         contextLength: 131072,
-        numParallel: 1,
+        // Two slots per model, not one. With a single slot the whole host serialises: frigate's
+        // vision calls (9.5 s of GPU work at the median) were dying against a hardcoded 120 s
+        // client deadline purely from queue wait — 65% of its aborts never got a slot at all.
+        numParallel: 2,
         maxQueue: 512,
         maxLoadedModels: 3,
         loadTimeout: "5m",

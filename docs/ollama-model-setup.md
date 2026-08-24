@@ -252,12 +252,37 @@ means a stop path failed to clean up.**
 To check by hand: `ps -Ao pid=,ppid=,command= | grep -E "Ollama.app.*(runner|llama-server)"` —
 anything with ppid 1 is an orphan.
 
-## Contention, not slowness
-Also measured 2026-08-24: `gemma4:26b` reported **88.8 s total duration for 2.6 s of actual
-work — 97 % internal queue wait**. With `OLLAMA_NUM_PARALLEL=1` the model serves strictly one
-request at a time, and three cluster clients (192.168.55.11/.12/.13, ~90–115 req/h) were
-saturating it. If an app feels slow against the 26b, check the queue before suspecting the
-model: raw generation was 56.5 tok/s, exactly its baseline.
+## Contention, not slowness — and why `NUM_PARALLEL` is now 2
+Measured 2026-08-24: `gemma4:26b` reported **88.8 s total duration for 2.6 s of actual work —
+97 % internal queue wait**, while raw generation sat at 56.5 tok/s, exactly its baseline. If an
+app feels slow against the 26b, check the queue before suspecting the model.
+
+Root cause, traced across the access log and the cluster: on **2026-08-16** a Talos maintenance
+reboot recreated the Frigate pod, which activated a GenAI config committed on 2026-07-14 (its
+ConfigMap is a `subPath` mount with no Reloader annotation, so it only takes effect on pod
+recreation). Vision requests jumped from 2–3/day to **1011/day with 3862 images decoded**.
+
+Frigate then timed out against its own load. Its client deadline is **120 s hardcoded** in
+`genai/__init__.py` — not exposed in Frigate's config — and the bundled OpenAI SDK retries
+twice, so one failed description costs three 120 s requests. Its compute need is p50 **9.5 s**;
+only 0.41 % of requests exceed 120 s of GPU time, yet 627 died at exactly 120 s and **65 % of
+those never got a slot at all**. Pure queue wait, self-inflicted.
+
+**Fix: `OLLAMA_NUM_PARALLEL` 1 → 2.** Verified after the change: the runner starts with
+`-c 262144 -np 2` (`n_slots = 2, n_ctx_slot = 131072` — each slot keeps the full context), and
+two concurrent requests both finish in 3.7 s instead of serialising. **Memory is unchanged at
+17 GB** despite the doubled `-c`, for the same sliding-window reason that made the 131k→68k
+experiment pointless.
+
+Two attribution traps worth remembering, both of which produced wrong conclusions first:
+- **The client IPs in the access log are node IPs, not pods.** Three distinct client timeouts
+  on one address (120 s Frigate / 1800 s Sure / 3600 s unattributed) is what gave it away.
+- **A client "appearing" or "vanishing" is usually a pod reschedule.** Sure looked like it
+  stepped 50× on 2026-08-17; it had simply moved from node `.12` to `.11` in the same Talos
+  roll. Its actual job counts show no step.
+
+The log cannot settle this on its own: Ollama's gin logger records no User-Agent and no model
+name (verified across 3.83 M lines), so per-app attribution has to come from the cluster side.
 
 ## Rollback / operational notes
 - **Engine rollback**: `/Applications/Ollama-0.31.1.app` (and `-0.30.8`, `-0.24.0`) backups
