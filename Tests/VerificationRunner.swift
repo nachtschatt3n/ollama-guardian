@@ -286,6 +286,51 @@ private func testLogMonitorRecoversAfterRotation() throws {
     )
 }
 
+private func testLogMonitorIgnoresGuardianPolling() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ollama-guardian-polling-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let path = directory.appendingPathComponent("ollama.log").path
+
+    // The guardian polls these two every 5 seconds; ollama logs them like any other request.
+    let polling = """
+    [GIN] 2026/08/24 - 20:30:22 | 200 |      69.541µs |       127.0.0.1 | GET      "/api/version"
+    [GIN] 2026/08/24 - 20:30:22 | 200 |    1.740166ms |       127.0.0.1 | GET      "/api/ps"
+
+    """
+    try Data(String(repeating: polling, count: 12).utf8).write(to: URL(fileURLWithPath: path))
+
+    let monitor = LogMonitor()
+    let pollingOnly = monitor.scan(path: path, parallelLimit: 1)
+    try expect(
+        pollingOnly.requestRate.requestsPerMinute == 0,
+        "Guardian polling must not count as traffic, got \(pollingOnly.requestRate.requestsPerMinute)/min"
+    )
+    try expect(
+        pollingOnly.inference.lastInferenceTimestamp == nil,
+        "Polling must not refresh the last-inference timestamp — the watchdog relies on it going stale"
+    )
+
+    // A real inference request in the same file must still be counted.
+    let handle = try LogRotator.openAppendHandle(path: path)
+    defer { try? handle.close() }
+    try handle.write(contentsOf: Data(
+        "[GIN] 2026/08/24 - 20:30:25 | 200 |   742.31ms |  192.168.55.11 | POST     \"/api/generate\"\n".utf8
+    ))
+
+    let withRequest = monitor.scan(path: path, parallelLimit: 1)
+    try expect(
+        withRequest.requestRate.requestsPerMinute == 1,
+        "A real /api/generate should count, got \(withRequest.requestRate.requestsPerMinute)/min"
+    )
+    try expect(
+        withRequest.inference.lastInferenceEndpoint == "/api/generate",
+        "Real inference should set the endpoint"
+    )
+}
+
 private func testReaperFindsOrphanedRunnersOnly() throws {
     // Real shapes taken from `ps -Ao pid=,ppid=,command=` on the Mac mini.
     let psOutput = """
@@ -354,6 +399,7 @@ enum VerificationRunner {
             ("APIState semver compare detects newer releases", testApiStateSemverCompareDetectsNewerRelease),
             ("Log rotation truncates in place and keeps generations", testLogRotationTruncatesInPlaceAndKeepsGenerations),
             ("LogMonitor recovers after a rotation", testLogMonitorRecoversAfterRotation),
+            ("LogMonitor ignores guardian polling", testLogMonitorIgnoresGuardianPolling),
             ("Reaper finds orphaned runners only", testReaperFindsOrphanedRunnersOnly),
             ("Reaper rejects serve and foreign binaries", testReaperRejectsServeAndForeignBinaries),
         ]

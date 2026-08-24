@@ -477,7 +477,13 @@ final class LogMonitor {
             if let chunk = String(data: data, encoding: .utf8), !chunk.isEmpty {
                 for line in chunk.split(whereSeparator: \.isNewline) {
                     let lineString = String(line)
-                    if let completion = Self.parseGinCompletion(line: lineString, now: now) {
+                    // Only inference endpoints count. The guardian polls /api/version and
+                    // /api/ps every 5s, and those are logged as ordinary [GIN] lines — counting
+                    // them put a permanent ~24/min floor under the request rate and, worse, kept
+                    // refreshing lastInferenceTimestamp so the watchdog's no-inference rule
+                    // could never fire on an idle-but-stuck runtime.
+                    if let completion = Self.parseGinCompletion(line: lineString, now: now),
+                       interestingEndpoints.contains(completion.endpoint) {
                         recentRequests.append(completion)
                         newEndpoint = completion.endpoint
                     } else if let endpoint = Self.extractEndpoint(from: lineString, matches: interestingEndpoints) {
