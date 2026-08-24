@@ -529,6 +529,9 @@ struct GuardianSnapshot: Codable, Equatable {
     var reloadCount: Int
     var cooldownUntil: Date?
     var managedLogPath: String
+    /// Runners left behind by a previous server that the last start had to clean up. Anything
+    /// above zero means a stop path failed to reap its children.
+    var orphanedRunnersReaped: Int = 0
 
     static let empty = GuardianSnapshot(
         system: .empty,

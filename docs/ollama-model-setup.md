@@ -107,6 +107,38 @@ Server & Paths). It uses copy-truncate, not rename: the child processes hold the
 descriptor for weeks, so a rename would leave them writing to the renamed inode. Added
 2026-08-13 after `ollama.log` reached 713 MB unbounded.
 
+## Orphaned model runners (found 2026-08-24)
+`ollama serve` spawns one **runner child per loaded model** (`ollama runner --mlx-engine …` for
+MLX, `llama-server` for GGUF), each on an ephemeral localhost port. When the server is killed
+rather than shut down gracefully, those children survive, are reparented to launchd, and keep
+their model resident. **`ollama ps` cannot see them** — it reports only the current server's own
+runners — so the memory is invisible to every normal check.
+
+The 0.31.1→0.32.9 restart on 2026-08-13 left two behind. Eleven days later one was still holding
+**6.2 GB** for a `gemma4:e2b-mlx` nothing was talking to. Effect, measured before and after
+killing it:
+
+| | with orphan | after reaping |
+|---|---|---|
+| `gemma4:e2b-mlx` generation | 72.8 tok/s | **148.6 tok/s** |
+| `gemma4:26b` generation | 56.5 tok/s | 57.6 tok/s (unaffected) |
+| Swap in use | 26.3 GB | 19.6 GB |
+
+The GGUF model was never affected — only the MLX one, which is the memory-pressure-sensitive
+path. The Guardian now terminates runner children on stop and sweeps orphans on start
+(`RunnerReaper`), reporting `ollama_guardian_orphaned_runners_reaped`. **A non-zero value there
+means a stop path failed to clean up.**
+
+To check by hand: `ps -Ao pid=,ppid=,command= | grep -E "Ollama.app.*(runner|llama-server)"` —
+anything with ppid 1 is an orphan.
+
+## Contention, not slowness
+Also measured 2026-08-24: `gemma4:26b` reported **88.8 s total duration for 2.6 s of actual
+work — 97 % internal queue wait**. With `OLLAMA_NUM_PARALLEL=1` the model serves strictly one
+request at a time, and three cluster clients (192.168.55.11/.12/.13, ~90–115 req/h) were
+saturating it. If an app feels slow against the 26b, check the queue before suspecting the
+model: raw generation was 56.5 tok/s, exactly its baseline.
+
 ## Rollback / operational notes
 - **Engine rollback**: `/Applications/Ollama-0.31.1.app` (and `-0.30.8`, `-0.24.0`) backups
   exist — quit the Guardian, swap `/Applications/Ollama.app`, relaunch.

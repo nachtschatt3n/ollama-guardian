@@ -23,6 +23,7 @@ It also supervises a self-hosted **local TTS fallback** (Qwen3-TTS via mlx-audio
 - Supervises a local **TTS fallback** server (Qwen3-TTS via mlx-audio) as a managed process: lazy model load, health polling, and automatic restart on crash.
 - Checks daily for a newer Ollama release (GitHub) and for stale loaded-model digests (Ollama registry), surfacing an in-app banner/badge and a "Check for Updates" action.
 - Rotates the managed Ollama and TTS logs by size (copy-truncate, so the running servers keep writing to the same file), keeping a configurable number of generations.
+- Reaps orphaned model runners: when an Ollama server is killed, its per-model runner children survive, keep the model resident, and stay invisible to `ollama ps`. The Guardian terminates them on stop and sweeps leftovers on start, reporting the count as `ollama_guardian_orphaned_runners_reaped`.
 - Exposes Prometheus metrics on a configurable network bind host and port.
 - Exposes a bearer-protected control API for restart, warmup, cooldown clearing, status, and recent logs.
 - Shows actionable recovery guidance instead of crashing when required runtime pieces are missing or misconfigured.
@@ -128,6 +129,7 @@ Key exported metrics include:
 - `ollama_guardian_last_inference_timestamp_seconds`
 - `ollama_guardian_last_reload_timestamp_seconds`
 - `ollama_guardian_stuck_state`
+- `ollama_guardian_orphaned_runners_reaped`
 - `ollama_guardian_ollama_update_available`
 - `ollama_guardian_model_update_available{model="..."}`
 - `ollama_guardian_tts_enabled`
@@ -218,6 +220,7 @@ Sources/local-ollama-monitor/
   Diagnostics.swift
   Models.swift
   LogRotation.swift        # size-based copy-truncate rotation for the managed child logs
+  RunnerReaper.swift       # finds and kills model runners orphaned by a previous server
   OllamaRuntime.swift      # Ollama process, log/RPM monitor, release + registry checks
   TTSRuntime.swift         # managed TTS server process + health client
   SettingsStore.swift

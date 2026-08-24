@@ -444,6 +444,9 @@ final class GuardianController: ObservableObject {
         lines.append("# HELP ollama_guardian_health_failure_streak Consecutive failed health checks.")
         lines.append("# TYPE ollama_guardian_health_failure_streak gauge")
         lines.append("ollama_guardian_health_failure_streak \(current.api.healthFailureStreak)")
+        lines.append("# HELP ollama_guardian_orphaned_runners_reaped Model runners left by a previous server that the last start had to clean up.")
+        lines.append("# TYPE ollama_guardian_orphaned_runners_reaped gauge")
+        lines.append("ollama_guardian_orphaned_runners_reaped \(current.orphanedRunnersReaped)")
         lines.append("# HELP ollama_guardian_tts_enabled Whether the local TTS fallback is enabled.")
         lines.append("# TYPE ollama_guardian_tts_enabled gauge")
         lines.append("ollama_guardian_tts_enabled \(current.tts.enabled ? 1 : 0)")
@@ -472,6 +475,7 @@ final class GuardianController: ObservableObject {
         startSamplingLoop()
         let currentConfig = savedConfig
         try await backend.startManagedProcess(config: currentConfig)
+        snapshot.orphanedRunnersReaped = await backend.orphanedRunnersReaped
         let version = try await backend.waitForHealthyAPI(baseURL: currentConfig.resolvedOllamaBaseURL)
         snapshot.api.version = version
         snapshot.api.healthy = true
@@ -619,6 +623,7 @@ final class GuardianController: ObservableObject {
         let currentConfig = savedConfig
         try await backend.stopManagedProcess(force: true)
         try await backend.startManagedProcess(config: currentConfig)
+        snapshot.orphanedRunnersReaped = await backend.orphanedRunnersReaped
         let version = try await backend.waitForHealthyAPI(baseURL: currentConfig.resolvedOllamaBaseURL)
         snapshot.api.version = version
         snapshot.api.healthy = true

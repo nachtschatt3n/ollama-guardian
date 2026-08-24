@@ -204,6 +204,9 @@ actor OllamaRegistryClient {
 
 final class ManagedProcess: @unchecked Sendable {
     private(set) var process: Process?
+    /// How many orphaned runners the last start had to clean up. Surfaced as a metric so a
+    /// recurring leak shows up instead of silently eating memory.
+    private(set) var orphansReapedAtLastStart = 0
     var logger: FileLogger
 
     init(logger: FileLogger) {
@@ -223,6 +226,14 @@ final class ManagedProcess: @unchecked Sendable {
         ) else {
             throw GuardianRuntimeError.missingOllamaExecutable
         }
+
+        // Runners orphaned by an earlier hard stop still hold their model's memory and bind
+        // ephemeral ports, so the port preflight above cannot see them. Sweep before starting.
+        let reaped = RunnerReaper.reapOrphans(ollamaPath: ollamaPath, logger: logger)
+        if reaped > 0 {
+            logger.write("reaped \(reaped) orphaned ollama runner(s) before start")
+        }
+        orphansReapedAtLastStart = reaped
 
         let logDirectory = (config.managedLogPath as NSString).deletingLastPathComponent
         do {
@@ -278,6 +289,20 @@ final class ManagedProcess: @unchecked Sendable {
     func stop(force: Bool = false) throws {
         guard let process else { return }
         if process.isRunning {
+            // Collect and signal the runner children first. `ollama serve` reaps them itself on
+            // a graceful exit, but not when it has to be SIGKILLed below — and once the parent
+            // is gone they are reparented to launchd and can no longer be found this way.
+            if let ollamaPath = ExecutableLocator.findExecutable(
+                named: "ollama",
+                fallbackDirectories: ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+            ) {
+                RunnerReaper.terminateChildren(
+                    of: process.processIdentifier,
+                    ollamaPath: ollamaPath,
+                    logger: logger
+                )
+            }
+
             process.terminate()
             let deadline = Date().addingTimeInterval(force ? 3 : 8)
             while process.isRunning && Date() < deadline {
@@ -647,6 +672,8 @@ actor GuardianBackend {
     func startManagedProcess(config: GuardianConfig) throws {
         try processManager.start(config: config)
     }
+
+    var orphanedRunnersReaped: Int { processManager.orphansReapedAtLastStart }
 
     func stopManagedProcess(force: Bool) throws {
         try processManager.stop(force: force)

@@ -286,6 +286,54 @@ private func testLogMonitorRecoversAfterRotation() throws {
     )
 }
 
+private func testReaperFindsOrphanedRunnersOnly() throws {
+    // Real shapes taken from `ps -Ao pid=,ppid=,command=` on the Mac mini.
+    let psOutput = """
+    10447 1 /Applications/Ollama.app/Contents/Resources/ollama runner --mlx-engine --model gemma4:e2b-mlx --port 54607
+    10459 1 /Applications/Ollama.app/Contents/Resources/llama-server --model /Users/mu/.ollama/models/blobs/sha256-970aa --port 54650
+    91552 91511 /Applications/Ollama.app/Contents/Resources/llama-server --model /Users/mu/.ollama/models/blobs/sha256-712 --port 49520
+    64901 91511 /Applications/Ollama.app/Contents/Resources/ollama runner --mlx-engine --model gemma4:e2b-mlx --port 51122
+    91511 91503 /Applications/Ollama.app/Contents/Resources/ollama serve
+    4242 1 /opt/homebrew/bin/llama-server --model /Users/mu/other/model.gguf --port 8081
+    """
+
+    let orphans = RunnerReaper.orphanedRunners(
+        in: psOutput,
+        runtimeDirectory: "/Applications/Ollama.app/Contents/Resources"
+    )
+    let pids = Set(orphans.map(\.pid))
+
+    try expect(pids == [10447, 10459], "Should reap exactly the two launchd-parented runners, got \(pids.sorted())")
+    try expect(!pids.contains(91552) && !pids.contains(64901), "Runners of a live server must never be reaped")
+    try expect(!pids.contains(91511), "`ollama serve` itself must never be matched as a runner")
+    try expect(!pids.contains(4242), "An unrelated llama-server outside the Ollama runtime directory must be left alone")
+}
+
+private func testReaperRejectsServeAndForeignBinaries() throws {
+    let directory = "/Applications/Ollama.app/Contents/Resources"
+
+    try expect(
+        RunnerReaper.isRunnerCommand("\(directory)/ollama runner --mlx-engine --model x", runtimeDirectory: directory),
+        "The MLX runner invocation should match"
+    )
+    try expect(
+        RunnerReaper.isRunnerCommand("\(directory)/llama-server --model x", runtimeDirectory: directory),
+        "The GGUF runner should match"
+    )
+    try expect(
+        !RunnerReaper.isRunnerCommand("\(directory)/ollama serve", runtimeDirectory: directory),
+        "`ollama serve` must not be treated as a runner"
+    )
+    try expect(
+        !RunnerReaper.isRunnerCommand("/opt/homebrew/bin/ollama runner --model x", runtimeDirectory: directory),
+        "A runner from a different install must not match"
+    )
+    try expect(
+        !RunnerReaper.isRunnerCommand("/usr/bin/llama-server", runtimeDirectory: directory),
+        "A same-named binary elsewhere must not match"
+    )
+}
+
 @main
 enum VerificationRunner {
     static func main() {
@@ -306,6 +354,8 @@ enum VerificationRunner {
             ("APIState semver compare detects newer releases", testApiStateSemverCompareDetectsNewerRelease),
             ("Log rotation truncates in place and keeps generations", testLogRotationTruncatesInPlaceAndKeepsGenerations),
             ("LogMonitor recovers after a rotation", testLogMonitorRecoversAfterRotation),
+            ("Reaper finds orphaned runners only", testReaperFindsOrphanedRunnersOnly),
+            ("Reaper rejects serve and foreign binaries", testReaperRejectsServeAndForeignBinaries),
         ]
 
         var failures: [String] = []
