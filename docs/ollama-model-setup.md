@@ -1,9 +1,9 @@
 # Ollama model setup (Mac mini)
 
-The local LLM setup this Guardian manages: **Ollama 0.32.9** on the Mac mini (Apple M4 Pro,
+The local LLM setup this Guardian manages: **Ollama 0.32.15** on the Mac mini (Apple M4 Pro,
 48 GB unified memory), serving `192.168.30.111:11434` to the home-lab cluster. A separate
 mlx-audio Qwen3-TTS server runs at `:8000` (see [tts-voice-tuning.md](tts-voice-tuning.md)).
-Last reviewed 2026-08-13.
+Last reviewed 2026-08-24.
 
 ## Model roster (3 models, all kept warm)
 
@@ -77,6 +77,9 @@ correct name/args, the streaming wire format above, 768-dim embeddings, and all 
 back to `Forever`.
 
 ## Measured performance (0.32.9, 2026-08-13)
+> Re-measured on 0.32.15 on 2026-08-24: `gemma4:26b` unchanged at 57.2 tok/s generation and
+> 670 tok/s prefill, so the figures below still hold.
+
 Measured on the live host, so numbers carry some noise from real cluster traffic. Prefill was
 measured with a unique nonce at the head of each prompt — without it Ollama's prompt cache
 returns a near-zero prompt-eval duration and nonsensical throughput.
@@ -100,6 +103,92 @@ returns a near-zero prompt-eval duration and nonsensical throughput.
 - **Long prompts are the 26b's weak spot**: 20k tokens of input cost ~41 s before the first
   token, and prefill throughput decays with length while the MLX model's stays flat. Route
   bulk/long-context text work to `e2b-mlx` where quality allows.
+
+## Engine: 0.32.9 → 0.32.15 (2026-08-24)
+Taken because `qwen3.8` requires ≥ 0.32.12 (the pull is refused outright below that), and
+0.32.13–0.32.15 add three follow-up fixes for that model — stopping at .12 would have walked
+into them. Two changes help regardless of any model swap:
+- **Model metadata is cached between requests**, roughly halving time-to-first-token
+  (Ollama's benchmark: 995 ms → 524 ms).
+- **Fixed chat/generate wedging after a mid-stream parser error** — precisely the stuck-runtime
+  class the Guardian's watchdog exists for.
+
+Accepted risk: 0.32.10 flipped the `repeat_penalty` default from 1.1 to 1.0 (off) for models
+that don't set one, and `gemma4:26b` doesn't. Watch for repetition; a Modelfile
+`PARAMETER repeat_penalty 1.1` restores the old behaviour if it appears.
+
+Backup at `/Applications/Ollama-0.32.9.app`.
+
+## Candidate evaluations — is anything better than `gemma4:26b`?
+
+### Method
+A model can replace the everything-model here only if it clears four bars, so all candidates
+run the same suite (`compare.py` in the session scratchpad):
+1. **vision** — discriminative red/green image test. A single image can be passed by guessing;
+   both must be right. Registry `capabilities` metadata is **not** evidence (see the Gemma 4
+   MLX case above, where it advertises vision the engine does not implement).
+2. **tools** — openclaw / hermes / librechat depend on it.
+3. **structured JSON** — sure-worker's real workload: 5 transactions in, merchant + category
+   out, counting empty fields rather than just "was it parseable".
+4. **speed** — generation *and* prefill. Prefill turned out to be the discriminator.
+
+Note when testing: these models have `thinking` enabled by default, which consumes the
+`num_predict` budget before any answer appears. Pass `"think": false` or the model looks
+broken. Similarly, bare `format: "json"` constrains output to a *single object*, and the model
+then answers only the first of five transactions — a plausible source of the nulls that drive
+sure's retries. Use a real JSON schema.
+
+### qwen3.8:27b-mlx — rejected 2026-08-24
+
+| | `gemma4:26b` (MoE) | `qwen3.8:27b-mlx` (dense) |
+|---|---|---|
+| Vision (discriminative) | ✅ | ✅ |
+| Tool calling | ✅ | ✅ |
+| JSON, 5 transactions | 5/5, 0 empty, 1.6 s | 5/5, 0 empty, 3.3 s |
+| **Generation** | **57.2 tok/s** | **28.0 tok/s** |
+| **Prefill** | **670 tok/s** | **118 tok/s** |
+
+Time to first token, by prompt size:
+
+| Prompt | `gemma4:26b` | `qwen3.8:27b-mlx` |
+|---|---|---|
+| 1.8k tokens | 2.7 s | 14.8 s |
+| 6k tokens | 9.2 s | 49.2 s |
+| 20k tokens | 40.8 s | **173.6 s** |
+
+Qualitatively equal — it fails purely on speed, and **prefill (5.7×) hurts far more than
+generation (2.0×)**, because that is what this host's traffic is made of.
+
+Worth recording: **vision genuinely works in Qwen 3.8's MLX build.** So Ollama's MLX engine is
+capable of vision; it simply omits it for the Gemma 4 conversions. That closes the question
+left open in July.
+
+### The deciding factor is MoE, not MLX
+`gemma4:26b` is a 26B-A4B: 128 experts, ~4B active. It reads ~3 GB of weights per token where
+a dense 27B reads all ~17 GB, and on an M4 Pro (~273 GB/s) generation is bandwidth-bound. That
+is why a GGUF MoE beats an MLX dense model on the supposedly better-optimised path.
+
+### Library survey (2026-08-24)
+All 20 vision-capable models in the Ollama library, checked for an MLX variant that fits:
+
+| Family | MLX tags | Verdict |
+|---|---|---|
+| `qwen3.5` | 0.8b–35b | **no `tools`** capability |
+| `qwen3.6` | 27b, 35b | **no `tools`**, and dense |
+| `gemma4` | e2b–31b | **vision absent in the engine** (proven for e2b/26b; 31b untested) |
+| `qwen3.8` | 27b | dense — measured above |
+| `muse-glimmer` | 30b | dense (52 layers, no experts) — **measured below** |
+| all others | none | no MLX build at all |
+
+Everything else is out on size (`mistral-medium-3.5` 80 GB, kimi-k2/k3 larger), too small for
+the quality bar (`qwen3-vl` 6 GB, `minicpm-v4.6` 1.6 GB), or a specialist (`glm-ocr` 2.2 GB,
+`medgemma`).
+
+→ **`gemma4:26b` stays.** It is currently the only model in the library combining vision,
+tools and MoE at a size that fits this box.
+
+Idea parked: `glm-ocr` (2.2 GB) as a *complement* rather than a replacement, to take OCR load
+off the 26b if paperless-gpt ever becomes the bottleneck.
 
 ## Log rotation
 The Guardian rotates `ollama.log` and `tts.log` at **64 MB, keeping 3 generations** (Settings →
