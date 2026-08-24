@@ -132,11 +132,18 @@ run the same suite (`compare.py` in the session scratchpad):
    out, counting empty fields rather than just "was it parseable".
 4. **speed** — generation *and* prefill. Prefill turned out to be the discriminator.
 
-Note when testing: these models have `thinking` enabled by default, which consumes the
-`num_predict` budget before any answer appears. Pass `"think": false` or the model looks
-broken. Similarly, bare `format: "json"` constrains output to a *single object*, and the model
-then answers only the first of five transactions — a plausible source of the nulls that drive
-sure's retries. Use a real JSON schema.
+Three traps, each of which produced a false negative before being understood — a model that
+looks broken here is usually the harness:
+- **`thinking` is on by default** and consumes the `num_predict` budget before any answer
+  appears. Pass `"think": false`.
+- **A tight `num_predict` still truncates**: some models (Muse Glimmer) emit a preamble even
+  with thinking disabled. 24 tokens reported "no vision"; 300 tokens answered correctly. Give
+  the vision probe room.
+- **Bare `format: "json"` constrains output to a *single object***, so the model answers only
+  the first of five transactions — a plausible source of the nulls driving sure's retries. Use
+  a real JSON schema.
+
+An empty response with `done_reason: "length"` is the signature of all three.
 
 ### qwen3.8:27b-mlx — rejected 2026-08-24
 
@@ -163,10 +170,34 @@ Worth recording: **vision genuinely works in Qwen 3.8's MLX build.** So Ollama's
 capable of vision; it simply omits it for the Gemma 4 conversions. That closes the question
 left open in July.
 
+### muse-glimmer:30b-mlx — rejected 2026-08-24
+Meta's 30B agent model, the most promising candidate on paper: vision + tools + thinking, and
+Ollama explicitly advertises "state-of-the-art performance on Apple Silicon" for it with DFlash
+support. It is nonetheless **dense** (52 layers, no experts), and that decides it.
+
+| | `gemma4:26b` (MoE) | `qwen3.8:27b-mlx` (dense) | `muse-glimmer:30b-mlx` (dense) |
+|---|---|---|---|
+| Vision (discriminative) | ✅ | ✅ | ✅ |
+| Tool calling | ✅ | ✅ | ✅ |
+| JSON, 5 transactions | 5/5, 0 empty, **1.5 s** | 5/5, 0 empty, 3.3 s | 5/5, 0 empty, **9.8 s** |
+| **Generation** | **59.4 tok/s** | 28.0 tok/s | **22.3 tok/s** |
+| **Prefill** | **635 tok/s** | 118 tok/s | **123 tok/s** |
+| Size on disk | 17.7 GB | 18.2 GB | 21.2 GB |
+
+All three are capability-equivalent; the two MLX models lose purely on speed. Muse Glimmer is
+the slowest of the three despite being the one explicitly tuned for Apple Silicon — DFlash did
+not close the dense gap. Its 9.8 s on the JSON task is **6.5× gemma's**, on exactly the
+workload that dominates this host.
+
 ### The deciding factor is MoE, not MLX
 `gemma4:26b` is a 26B-A4B: 128 experts, ~4B active. It reads ~3 GB of weights per token where
 a dense 27B reads all ~17 GB, and on an M4 Pro (~273 GB/s) generation is bandwidth-bound. That
 is why a GGUF MoE beats an MLX dense model on the supposedly better-optimised path.
+
+Two dense candidates now confirm it independently, and the pattern is consistent: both land at
+~120 tok/s prefill against gemma's ~650, regardless of MLX tuning or DFlash. **Treat "is it
+MoE?" as the first question about any future candidate** — check `num_experts` in the model's
+HuggingFace `config.json` before spending 20 GB of disk on a pull.
 
 ### Library survey (2026-08-24)
 All 20 vision-capable models in the Ollama library, checked for an MLX variant that fits:
@@ -177,7 +208,7 @@ All 20 vision-capable models in the Ollama library, checked for an MLX variant t
 | `qwen3.6` | 27b, 35b | **no `tools`**, and dense |
 | `gemma4` | e2b–31b | **vision absent in the engine** (proven for e2b/26b; 31b untested) |
 | `qwen3.8` | 27b | dense — measured above |
-| `muse-glimmer` | 30b | dense (52 layers, no experts) — **measured below** |
+| `muse-glimmer` | 30b | dense (52 layers, no experts) — measured, slowest of the three |
 | all others | none | no MLX build at all |
 
 Everything else is out on size (`mistral-medium-3.5` 80 GB, kimi-k2/k3 larger), too small for
