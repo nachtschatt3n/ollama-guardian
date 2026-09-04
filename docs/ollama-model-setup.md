@@ -1,16 +1,16 @@
 # Ollama model setup (Mac mini)
 
-The local LLM setup this Guardian manages: **Ollama 0.32.15** on the Mac mini (Apple M4 Pro,
+The local LLM setup this Guardian manages: **Ollama 0.33.3** on the Mac mini (Apple M4 Pro,
 48 GB unified memory), serving `192.168.30.111:11434` to the home-lab cluster. A separate
 mlx-audio Qwen3-TTS server runs at `:8000` (see [tts-voice-tuning.md](tts-voice-tuning.md)).
-Last reviewed 2026-08-24.
+Last reviewed 2026-09-05.
 
 ## Model roster (3 models, all kept warm)
 
 | Model | Role | Format | Context | Vision | Speed | Consumers |
 |---|---|---|---|---|---|---|
-| **`gemma4:26b`** | big / quality / **vision** — the everything-model | GGUF Q4_K_M | **131k** | ✅ | 57 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
-| **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ❌ | 163–193 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog |
+| **`gemma4:26b-mlx`** | big / quality / **vision** — the everything-model | MLX (26B-A4B) | **131k** (host env) | ✅ | 66–71 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
+| **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ❌ (no vision tensors at all) | 163–193 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog |
 | **`nomic-embed-text:latest`** | embeddings | — | — | — | 39 ms/doc | RAG: anythingllm, affine, nextcloud |
 
 Plus **`qwen3-tts`** (mlx-audio VoiceDesign, `:8000`) for TTS — OpenClaw voice notes, Open
@@ -118,6 +118,93 @@ that don't set one, and `gemma4:26b` doesn't. Watch for repetition; a Modelfile
 `PARAMETER repeat_penalty 1.1` restores the old behaviour if it appears.
 
 Backup at `/Applications/Ollama-0.32.9.app`.
+
+## Engine 0.32.15 → 0.33.3 and the GGUF → MLX migration (2026-09-04)
+
+`gemma4:26b` (GGUF Q4_K_M) was replaced by `gemma4:26b-mlx` across every consumer. Both the
+engine update and the model swap happened the same night; the deploy log for Sure records
+both so they stay separable.
+
+**Why the engine had to move first.** 0.33.3, released 2026-09-02, carries *"gemma4 now
+supports images and audio on MLX engine"*. On 0.32.15 the MLX runner had no image path at all.
+
+**Vision on MLX had been written off here on bad evidence.** The earlier "no Gemma 4 MLX with
+vision" conclusion was drawn from `gemma4:e2b-mlx`, whose weights carry **no vision tensors** —
+`/api/show` reports `capabilities: [completion, tools, thinking]` and there is not one
+`vision.*` key. That test never exercised the runner. `gemma4:26b-mlx` does ship the encoder;
+its config declares `vision_config: {model_type: gemma4_vision, hidden_size 1152, 27 layers}`,
+readable from the registry without pulling 18 GB. Verified live afterwards: it reads a
+five-digit number out of a synthetic test image and describes a scene correctly.
+
+**The two 26b builds cannot coexist. This is the operational rule.**
+
+```
+llama-server model predicted to exceed available memory, evicting
+  predicted="27.1 GiB"  predicted_num_ctx=262144
+```
+
+The GGUF reserves **27.1 GiB** — 18.6 of weights plus ~8.5 for its baked 131072 context times
+two parallel slots. The MLX build peaks at **18.7 GiB**. Together that is 45.8 of 48 GiB, so
+whichever loads second evicts the first, and with `OLLAMA_KEEP_ALIVE=-1` both stay pinned and
+fight. A vision request in that state panics the MLX runner outright:
+
+```
+panic: mlx: [METAL] Command buffer execution failed: Insufficient Memory
+  (kIOGPUCommandBufferCallbackErrorOutOfMemory)
+```
+
+That panic is **not** a defect in the model — with room, the same model answers in 1.5 s. It is
+purely the two-resident condition. A migration must therefore switch *every* consumer, then
+swap the model once. A gradual rollout is guaranteed to thrash: during the split state on
+2026-09-04, real cluster requests returned 500 after `Request terminated error="context
+canceled"`, i.e. clients giving up mid-load.
+
+### Measured: MLX serialises, llama.cpp batches
+
+Same prompts, `num_predict` 300, wall-clock throughput (tokens generated ÷ wall time):
+
+| concurrent | MLX per-request | MLX throughput | GGUF per-request | GGUF throughput |
+|---|---|---|---|---|
+| 1 | 71.5 tok/s | 63.3 | 58.6 tok/s | — |
+| 2 | 68.1 | 64.3 | 34.5 | 66.4 |
+| 4 | 69.1 | 64.6 | 34.9 | 66.6 |
+| 5 | 70.2 | 65.1 | — | — |
+| 6 | 69.0 | 64.5 | — | — |
+
+**Total throughput is the same (~64 vs ~66 tok/s)** — the machine is memory-bandwidth bound
+either way. What differs is scheduling, measured directly rather than inferred:
+
+```
+MLX,  4 concurrent:  peak simultaneous generation: 1 of 4   (perfect 4 s blocks, 67 tok/s each)
+GGUF, 2 concurrent:  peak simultaneous generation: 2 of 2   (35.2 tok/s each)
+```
+
+**The MLX runner ignores `OLLAMA_NUM_PARALLEL` entirely** and serves strictly one request at a
+time at full speed; llama.cpp fair-shares. Queue wait therefore grows linearly under MLX
+(0 → 2.3 → 6.9 → 9.5 → 11.5 s at n=1/2/4/5/6). Do not expect MLX to add capacity — it does not.
+What it buys is +22 % single-stream and 8.5 GiB of context allocation back.
+
+### Quality was verified, not assumed
+
+Different quantisation, so output equivalence was checked on the real workload before pointing
+Sure's merchant-detection batch at it. Identical, character for character, on all five German
+bank descriptors; German prose and arithmetic likewise equivalent. Vision latency in the final
+state is 1.53 s cold against the GGUF's 1.8 s.
+
+### Traps this migration walked into
+
+- **A model's config can live outside the manifest.** paperless-ngx stores it in the
+  `paperless_applicationconfiguration` DB row, which *wins over* the pod env — Django reported
+  `AI_ENABLED=False` while the DB said otherwise.
+- **A ConfigMap can be a seed, not the config.** `hermes-agent`'s init container copies it to a
+  PVC only if the file is absent; manifest correct, Flux green, pod restarted, and the live
+  process still read a 17-day-old file. Grep cannot find this class.
+- **The consumer inventory under-counts.** `docs/ai-usage-map.md` in the cluster repo was
+  missing `sure` — the single largest consumer — plus `hermes-agent` and `ha-ai-harness`.
+- **Nextcloud had four model keys**, not one.
+- **Any client sending its own `keep_alive` re-stamps the shared model's expiry.** Three Home
+  Assistant scripts sent `"60m"`, which silently un-pinned warm models fleet-wide; the Guardian
+  only pins at startup, so that persisted until the next restart.
 
 ## Candidate evaluations — is anything better than `gemma4:26b`?
 

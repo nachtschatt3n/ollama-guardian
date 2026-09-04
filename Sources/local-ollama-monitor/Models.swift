@@ -141,7 +141,13 @@ struct GuardianConfig: Codable, Equatable {
         controlBindHost: "0.0.0.0",
         controlBearerToken: UUID().uuidString.replacingOccurrences(of: "-", with: ""),
         warmModels: [
-            WarmModelConfig(name: "gemma4:26b", endpointType: .generate),
+            // The MLX build, not the GGUF. Both carry vision (verified 2026-09-04 on
+            // engine 0.33.3), but the GGUF reserves 27.1 GiB -- 18.6 of weights plus
+            // ~8.5 for its baked 131072 context times two slots -- against the MLX
+            // build's 18.7 GiB peak. On 48 GiB the two cannot coexist: whichever loads
+            // second evicts the first, and a vision request in that state panics the
+            // MLX runner outright. Keep exactly one 26b resident.
+            WarmModelConfig(name: "gemma4:26b-mlx", endpointType: .generate),
             WarmModelConfig(name: "gemma4:e2b-mlx", endpointType: .generate),
             WarmModelConfig(name: "nomic-embed-text:latest", endpointType: .embed),
         ],
