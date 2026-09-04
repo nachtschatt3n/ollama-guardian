@@ -168,6 +168,44 @@ private func testLogMonitorParsesGinCompletionLine() throws {
     try expect((request?.latency ?? 0) > 0.7 && (request?.latency ?? 0) < 0.8, "gin latency should round-trip to ~0.742s")
 }
 
+private func testLogMonitorParsesCompoundDurations() throws {
+    // Every one of these is a real latency string taken from the managed ollama.log
+    // on 2026-09-04, when the 26b was saturated. The old suffix-matching parser
+    // returned nil for all of the compound ones, so the requests that actually
+    // signalled the overload were the only ones the guardian never counted.
+    let cases: [(String, TimeInterval)] = [
+        ("8.708µs", 8.708e-6),
+        ("310.3845ms", 0.3103845),
+        ("44.2273205s", 44.2273205),
+        ("2m0s", 120),
+        ("4m23s", 263),
+        ("12m15s", 735),
+        ("30m0s", 1800),
+        ("1h2m3.5s", 3723.5),
+    ]
+
+    for (raw, expected) in cases {
+        guard let parsed = LogMonitor.parseLatency(raw) else {
+            try expect(false, "parseLatency returned nil for \(raw)")
+            return
+        }
+        try expect(abs(parsed - expected) < 1e-6, "parseLatency(\(raw)) = \(parsed), expected \(expected)")
+    }
+
+    try expect(LogMonitor.parseLatency("") == nil, "Empty latency should not parse")
+    try expect(LogMonitor.parseLatency("abc") == nil, "Non-numeric latency should not parse")
+    try expect(LogMonitor.parseLatency("12") == nil, "A bare number with no unit should not parse")
+}
+
+private func testLogMonitorCountsMinuteLongRequests() throws {
+    let now = Date()
+    let line = "[GIN] 2026/09/04 - 09:43:27 | 200 |         4m23s |   192.168.55.11 | POST     \"/v1/chat/completions\""
+    let request = LogMonitor.parseGinCompletion(line: line, now: now)
+    try expect(request != nil, "A multi-minute gin line should be parsed, not dropped")
+    try expect(request?.endpoint == "/v1/chat/completions", "endpoint should be /v1/chat/completions")
+    try expect(abs((request?.latency ?? 0) - 263) < 1e-6, "4m23s should round-trip to 263s")
+}
+
 private func testLogMonitorMaxOverlapComputesPeakConcurrency() throws {
     let now = Date()
     let requests: [CompletedRequest] = [
@@ -439,6 +477,8 @@ enum VerificationRunner {
             ("LogMonitor recovers after a rotation", testLogMonitorRecoversAfterRotation),
             ("LogMonitor does not replay history on startup", testLogMonitorDoesNotReplayHistoryOnStartup),
             ("LogMonitor ignores guardian polling", testLogMonitorIgnoresGuardianPolling),
+            ("Log monitor parses compound durations", testLogMonitorParsesCompoundDurations),
+            ("Log monitor counts minute-long requests", testLogMonitorCountsMinuteLongRequests),
             ("Reaper finds orphaned runners only", testReaperFindsOrphanedRunnersOnly),
             ("Reaper rejects serve and foreign binaries", testReaperRejectsServeAndForeignBinaries),
         ]

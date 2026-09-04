@@ -599,21 +599,42 @@ final class LogMonitor {
         return CompletedRequest(endTime: now, latency: latency, endpoint: endpoint)
     }
 
+    // Gin prints Go durations, and Go only renders a single unit below one second
+    // ("8.708µs", "310.3845ms"). From a second up it emits a compound
+    // ("2m0s", "12m15s", "1h2m3.5s"), so matching a trailing unit dropped every
+    // request over a minute -- exactly the ones that signal saturation. Walk the
+    // number/unit pairs instead. Order matters: "ms" has to win over "m", and
+    // "µs"/"us"/"ns" over "s".
+    private static let latencyUnits: [(unit: String, seconds: Double)] = [
+        ("ns", 1e-9),
+        ("µs", 1e-6),
+        ("us", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
+        ("m", 60.0),
+        ("h", 3600.0),
+    ]
+
     static func parseLatency(_ raw: String) -> TimeInterval? {
-        let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        let suffixes: [(String, Double)] = [
-            ("µs", 1e-6),
-            ("us", 1e-6),
-            ("ms", 1e-3),
-            ("s", 1.0),
-        ]
-        for (suffix, multiplier) in suffixes where trimmed.hasSuffix(suffix) {
-            let valuePart = trimmed.dropLast(suffix.count)
-            if let value = Double(valuePart) {
-                return value * multiplier
-            }
+        var remainder = Substring(raw.trimmingCharacters(in: .whitespaces))
+        guard !remainder.isEmpty else { return nil }
+
+        var total: TimeInterval = 0
+        var parsedAnyComponent = false
+
+        while !remainder.isEmpty {
+            let numberEnd = remainder.firstIndex { !($0.isNumber || $0 == ".") } ?? remainder.endIndex
+            guard numberEnd > remainder.startIndex,
+                  let value = Double(remainder[remainder.startIndex..<numberEnd]) else { return nil }
+            remainder = remainder[numberEnd...]
+
+            guard let match = Self.latencyUnits.first(where: { remainder.hasPrefix($0.unit) }) else { return nil }
+            total += value * match.seconds
+            remainder = remainder.dropFirst(match.unit.count)
+            parsedAnyComponent = true
         }
-        return nil
+
+        return parsedAnyComponent ? total : nil
     }
 
     static func extractPath(from methodPath: String) -> String? {
