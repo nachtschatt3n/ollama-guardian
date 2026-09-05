@@ -152,7 +152,14 @@ struct GuardianConfig: Codable, Equatable {
             WarmModelConfig(name: "nomic-embed-text:latest", endpointType: .embed),
         ],
         keepAlive: -1,
-        contextLength: 131072,
+        // 65536, not the 131072 the model supports. Measured across 15471 real prompts
+        // from the rotated logs: median 1080, p95 5782, p99 54407, max 73586. Exactly one
+        // prompt in 15471 exceeds 65536; 32768 would have truncated 257 (1.66%). The MLX
+        // build bakes no num_ctx of its own, so it takes this value and reserves it per
+        // parallel slot -- two slots at 131072 cost ~9-10 GiB of the runner's ~27.5 GiB
+        // peak, on a 48 GiB box that also hosts a 6.3 GiB Android emulator and was running
+        // at 96% swap. Halving the reservation buys that back for one truncated prompt.
+        contextLength: 65536,
         // Two slots. One was tried on 2026-09-05 and reverted within 20 minutes.
         // The reasoning that led there was wrong in a specific way worth recording: the MLX
         // runner does serialise *generation* (measured: "peak simultaneous generation: 1 of 4"),
