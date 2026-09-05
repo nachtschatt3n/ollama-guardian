@@ -153,9 +153,14 @@ struct GuardianConfig: Codable, Equatable {
         ],
         keepAlive: -1,
         contextLength: 131072,
-        // Two slots per model, not one. With a single slot the whole host serialises: frigate's
-        // vision calls (9.5 s of GPU work at the median) were dying against a hardcoded 120 s
-        // client deadline purely from queue wait — 65% of its aborts never got a slot at all.
+        // Two slots. One was tried on 2026-09-05 and reverted within 20 minutes.
+        // The reasoning that led there was wrong in a specific way worth recording: the MLX
+        // runner does serialise *generation* (measured: "peak simultaneous generation: 1 of 4"),
+        // but ollama's scheduler still admits num_parallel requests concurrently. With one slot
+        // the second request waits at the scheduler instead of interleaving, and callers hit
+        // their own deadlines -- a 5-token probe took 81.2 s of which 0.1 s was generation, and
+        // frigate burned two 120 s aborts in the first minutes. It ignores the setting for
+        // batching, not for admission.
         numParallel: 2,
         maxQueue: 512,
         maxLoadedModels: 3,
