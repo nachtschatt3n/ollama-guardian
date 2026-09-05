@@ -25,10 +25,26 @@ the ARAG Android emulator are the usual pressure, not Ollama).
 - **KV cache `q8_0` + flash attention** on the GGUF path (`gemma4:26b`, `nomic`) — halves
   K-cache memory, fits 131k comfortably. (These are llama.cpp flags; they do **not** apply
   to the MLX-engine `e2b-mlx`.)
-- `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=3`, `OLLAMA_KEEP_ALIVE=-1` (Guardian
-  injects these when it launches `ollama serve`).
+- `OLLAMA_NUM_PARALLEL=2`, `OLLAMA_CONTEXT_LENGTH=65536`, `OLLAMA_MAX_LOADED_MODELS=3`,
+  `OLLAMA_KEEP_ALIVE=-1` (Guardian injects these when it launches `ollama serve`).
+- **`OLLAMA_KEEP_ALIVE=-1` is a loaded footgun.** It pins *every* model anyone requests, not
+  just the warm set, and there are only three slots. One person picking an unusual model in
+  Open WebUI evicts a production model until the next restart. Worse, any client that sends
+  its own `keep_alive` re-stamps the shared model's expiry: three Home Assistant scripts sent
+  `"60m"` and silently un-pinned the warm set fleet-wide, and the Guardian only pins at
+  startup, so it stayed un-pinned until the next restart.
 
-## Why GGUF (not MLX) for the big model — evaluated & decided 2026-07-05
+## Why GGUF (not MLX) for the big model — decided 2026-07-05, **REVERSED 2026-09-04**
+
+> **Superseded.** Ollama 0.33.3 (2026-09-02) added *"gemma4 now supports images and audio on
+> MLX engine"*, and the whole fleet moved to `gemma4:26b-mlx` on 2026-09-04 — see the
+> migration section below. The reasoning preserved here was correct for the engine of the
+> time: the discriminative image test below ran against `gemma4:26b-mlx` itself and failed
+> because the *runner* had no image path at all, not because the weights lacked one. They
+> did not: the build declares `vision_config: {model_type: gemma4_vision, hidden_size 1152,
+> 27 layers}`, readable from the registry without pulling 18 GB. `gemma4:e2b-mlx` genuinely
+> has no vision tensors and never will — do not generalise from it to the 26b.
+
 
 Migrating the big model to `gemma4:26b-mlx` was evaluated and **rejected**:
 - **The MLX Gemma 4 builds are text-only in Ollama.** Verified with a discriminative image
@@ -47,12 +63,37 @@ Migrating the big model to `gemma4:26b-mlx` was evaluated and **rejected**:
 fast text-only edge model. (`qwen3-vl` VLMs are *not* installed — vision runs on the GGUF
 26b.)
 
-## Context: full 131k (kept)
-`gemma4:26b` runs at its default `num_ctx 131072`. Reducing to 68k was tried and **reverted**:
-gemma4 uses **sliding-window attention**, so KV barely scales past the window
-(18.0 GB @ 68k ≈ 17.7 GB @ 131k) — 68k gave no meaningful memory saving. `num_ctx` is a baked
-model parameter that overrides `OLLAMA_CONTEXT_LENGTH`; a fresh re-pull restores 131072
-automatically.
+## Context: 65536 (lowered 2026-09-05)
+
+`OLLAMA_CONTEXT_LENGTH=65536`. The MLX build bakes no `num_ctx` of its own — unlike the GGUF,
+which carried 131072 in the model file — so it takes this value and reserves it **per parallel
+slot**.
+
+The number is measured. Across 15471 real prompts from the rotated logs: median 1080, p95
+5782, max 73586. **Exactly one prompt exceeds 65536; 32768 would have truncated 257 (1.66 %).**
+Four of the large samples were a subagent's synthetic needle probes, so the p99 is contaminated
+and is not evidence of workload shape — the max and the over-threshold counts are.
+
+**Every consumer that declares a context window must move first, and stay in step.** This is
+not advice, it is the failure mode: `openclaw` and `hermes-agent` both declared 131072 and
+would have built prompts the host could no longer serve; both were lowered in
+cberg-home-nextgen `af67ee7e` *before* the host changed. Home Assistant is worse — it is the
+one consumer that puts `num_ctx` on the wire, and it **cannot omit it**: an unset value sends
+`DEFAULT_NUM_CTX = 8192`, not "inherit". A mismatched `num_ctx` forces an evict-and-reload of
+the pinned 18 GB model on every call. Its Voice subentry sat at 8192 against a 131072 host for
+weeks, silently reloading `e2b-mlx` on every voice command, until this was found.
+
+Earlier history: reducing the **GGUF** from 131k to 68k was tried in July and reverted — gemma4
+uses sliding-window attention, so its KV barely scaled past the window (18.0 GB @ 68k ≈ 17.7 GB
+@ 131k). That result does not transfer to the MLX runner, which reserves per slot up front.
+
+**Honest accounting of the saving.** The first measurement claimed 8.25 GiB and was wrong: it
+compared a loaded runner (26.07 GiB, after a night of traffic) against a freshly warmed one
+(17.82 GiB). `size_vram` grows monotonically with use and plateaus, so the two are not
+comparable. Like for like, after real traffic: **26.07 → ~24.1 GiB, about 2 GiB.** What did
+move unambiguously, because it is system-level and independent of warm-up timing: the
+compressor fell from 8.70 to 3.50 GiB and macOS shrank the swap file from 15360 to 7168 MiB on
+its own.
 
 ## Storage
 Roster trimmed to the 3 models above (~23 GB) on 2026-07-05; removed 14 unused models
@@ -360,6 +401,36 @@ those never got a slot at all**. Pure queue wait, self-inflicted.
 two concurrent requests both finish in 3.7 s instead of serialising. **Memory is unchanged at
 17 GB** despite the doubled `-c`, for the same sliding-window reason that made the 131k→68k
 experiment pointless.
+
+### Still 2 after the MLX move — but for a different reason (2026-09-05)
+
+The original justification above is void: it rests on llama.cpp genuinely batching, which the
+MLX runner does not do. Setting it back to 1 was tried anyway, to reclaim the KV reservation,
+and **reverted after 20 minutes**. The reasoning that led there was wrong in a way worth
+keeping:
+
+> The MLX runner ignores `num_parallel` for **batching**, not for **admission**.
+
+Both halves are measured. It serialises generation — four concurrent requests gave `peak
+simultaneous generation: 1 of 4`, in clean 4 s blocks at 67 tok/s each, while llama.cpp under
+the same test gave `2 of 2` at 35.2 tok/s each. But ollama's scheduler still admits
+`num_parallel` requests concurrently, so with one slot the second request waits at the
+scheduler instead of interleaving. Within minutes: a 5-token probe took **81.2 s of which
+0.1 s was generation**, `/v1/chat/completions` aborted at 3m0s and 15m0s, and frigate burned
+two 120 s timeouts. After reverting, the same probe: **1.1 s, 0.0 s queue.**
+
+**The real cost of the MLX move, stated plainly:** aggregate throughput is unchanged (~64 vs
+~66 tok/s — the host is memory-bandwidth bound either way), but a short request queued behind
+a long one now waits for it *entirely*, where llama.cpp let it progress at half speed. This is
+head-of-line blocking, and it is normal, not a fault: a 2446-token request ran 13.3 s, and a
+trivial probe started 3 s in returned after 10.6 s — exactly the remaining time. Three separate
+"the host is wedged" reports during the migration were all this, including two of my own; each
+time the queue was someone else's benchmark. **Before diagnosing the host, check who else is
+mid-request.**
+
+It also makes Sure a latency *source*, not just a consumer: 319 candidates at
+`AUTO_DETECT_MERCHANTS_BATCH_SIZE=5` is 64 sequential requests of 13–55 s, and that job hangs
+off every sync, not just the 02:22 UTC one. Backfills belong outside usage hours.
 
 Two attribution traps worth remembering, both of which produced wrong conclusions first:
 - **The client IPs in the access log are node IPs, not pods.** Three distinct client timeouts
