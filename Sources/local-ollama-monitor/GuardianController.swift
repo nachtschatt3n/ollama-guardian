@@ -27,6 +27,13 @@ final class GuardianController: ObservableObject {
     private var actionTask: Task<Void, Never>?
     private var updateCheckTask: Task<Void, Never>?
     private var mutatingActionInFlight = false
+    /// Per-model timestamp of the last warm-set repair attempt (see `WarmSetRepair.due`).
+    private var lastWarmRepairAttempt: [String: Date] = [:]
+    /// The sampling loop starts before the managed server does, so its first ticks see an empty
+    /// `/api/ps`. Without this gate they would "repair" every warm model in a race with the
+    /// startup warm itself -- harmless but redundant, and it made the repair counter read 3 at
+    /// every launch. Repairs only count once the startup warm has actually finished.
+    private var startupWarmComplete = false
     private var consecutiveHighCPUCount = 0
     private var ttsHealthFailureStreak = 0
     private var ttsRestartInFlight = false
@@ -447,6 +454,9 @@ final class GuardianController: ObservableObject {
         lines.append("# HELP ollama_guardian_orphaned_runners_reaped Model runners left by a previous server that the last start had to clean up.")
         lines.append("# TYPE ollama_guardian_orphaned_runners_reaped gauge")
         lines.append("ollama_guardian_orphaned_runners_reaped \(current.orphanedRunnersReaped)")
+        lines.append("# HELP ollama_guardian_warm_set_repairs_total Warm models the sampling loop found evicted and re-warmed on its own.")
+        lines.append("# TYPE ollama_guardian_warm_set_repairs_total counter")
+        lines.append("ollama_guardian_warm_set_repairs_total \(current.warmSetRepairs)")
         lines.append("# HELP ollama_guardian_tts_enabled Whether the local TTS fallback is enabled.")
         lines.append("# TYPE ollama_guardian_tts_enabled gauge")
         lines.append("ollama_guardian_tts_enabled \(current.tts.enabled ? 1 : 0)")
@@ -484,6 +494,7 @@ final class GuardianController: ObservableObject {
             try await backend.warmConfiguredModels(config: currentConfig)
         }
         adoptAppliedRuntimeConfig(currentConfig)
+        startupWarmComplete = true
         clearIssue(
             matchingTitles: [
                 "Install Ollama First",
@@ -577,6 +588,8 @@ final class GuardianController: ObservableObject {
             snapshot.api.healthFailureStreak += 1
         }
 
+        await repairWarmSetIfNeeded(runtimeConfig: runtimeConfig, loadedModels: result.loadedModels)
+
         if let timestamp = result.inference.lastInferenceTimestamp {
             snapshot.inference.lastInferenceTimestamp = timestamp
             snapshot.inference.lastInferenceEndpoint = result.inference.lastInferenceEndpoint
@@ -609,6 +622,32 @@ final class GuardianController: ObservableObject {
         }
 
         await refreshTTS()
+    }
+
+    /// Runs on every sampling tick. Warms any configured model that `/api/ps` no longer lists,
+    /// so an eviction (Metal OOM, a client's own `keep_alive`) heals without a human. Skipped
+    /// while a reload or manual action owns the server, and rate-limited per model.
+    private func repairWarmSetIfNeeded(runtimeConfig: GuardianConfig, loadedModels: [String]?) async {
+        guard startupWarmComplete,
+              runtimeConfig.keepWarmEnabled,
+              snapshot.api.healthy,
+              !snapshot.reloadInProgress,
+              !snapshot.cooldownActive,
+              !mutatingActionInFlight,
+              let loadedModels else { return }
+
+        let missing = WarmSetRepair.missing(warmModels: runtimeConfig.warmModels, loaded: loadedModels)
+        guard !missing.isEmpty else { return }
+
+        let (due, attempts) = WarmSetRepair.due(missing, lastAttempt: lastWarmRepairAttempt, now: Date())
+        lastWarmRepairAttempt = attempts
+        guard !due.isEmpty else { return }
+
+        let repaired = await backend.repairWarmSet(missing: due, config: runtimeConfig)
+        if repaired > 0 {
+            snapshot.warmSetRepairs += repaired
+            logger.write("warm set repair: re-warmed \(repaired) of \(due.count) missing model(s); total repairs \(snapshot.warmSetRepairs)")
+        }
     }
 
     private func reloadOllama(trigger: ReloadTrigger, message: String) async throws {

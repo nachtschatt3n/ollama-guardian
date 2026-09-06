@@ -553,6 +553,9 @@ struct GuardianSnapshot: Codable, Equatable {
     /// Runners left behind by a previous server that the last start had to clean up. Anything
     /// above zero means a stop path failed to reap its children.
     var orphanedRunnersReaped: Int = 0
+    /// Warm models the sampling loop found evicted and re-warmed on its own. Counts models,
+    /// not incidents; a Metal OOM that evicts two models adds two.
+    var warmSetRepairs: Int = 0
 
     static let empty = GuardianSnapshot(
         system: .empty,

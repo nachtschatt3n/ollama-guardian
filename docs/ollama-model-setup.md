@@ -31,8 +31,15 @@ the ARAG Android emulator are the usual pressure, not Ollama).
   just the warm set, and there are only three slots. One person picking an unusual model in
   Open WebUI evicts a production model until the next restart. Worse, any client that sends
   its own `keep_alive` re-stamps the shared model's expiry: three Home Assistant scripts sent
-  `"60m"` and silently un-pinned the warm set fleet-wide, and the Guardian only pins at
-  startup, so it stayed un-pinned until the next restart.
+  `"60m"` and silently un-pinned the warm set fleet-wide, and until 2026-09-06 the Guardian
+  only pinned at startup, so it stayed un-pinned until the next restart.
+- **Warm-set repair (2026-09-06).** The sampling loop now re-warms any configured model that
+  `/api/ps` no longer lists, rate-limited to one attempt per model per minute and gated on the
+  startup warm having finished. Live-tested by evicting `e2b-mlx` with `keep_alive: 0`: back
+  within 40 s, no human involved. This is what makes "leave the 8 GiB prefix cache alone"
+  safe -- an OOM now costs a few retried requests and nothing silent. It does not yet detect
+  a model that is still resident but was *un-pinned* by a foreign `keep_alive`; that needs
+  `expires_at` from `/api/ps`, which the sampler does not parse today.
 
 ## Why GGUF (not MLX) for the big model — decided 2026-07-05, **REVERSED 2026-09-04**
 

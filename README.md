@@ -24,6 +24,7 @@ It also supervises a self-hosted **local TTS fallback** (Qwen3-TTS via mlx-audio
 - Checks daily for a newer Ollama release (GitHub) and for stale loaded-model digests (Ollama registry), surfacing an in-app banner/badge and a "Check for Updates" action.
 - Rotates the managed Ollama and TTS logs by size (copy-truncate, so the running servers keep writing to the same file), keeping a configurable number of generations.
 - Reaps orphaned model runners: when an Ollama server is killed, its per-model runner children survive, keep the model resident, and stay invisible to `ollama ps`. The Guardian terminates them on stop and sweeps leftovers on start, reporting the count as `ollama_guardian_orphaned_runners_reaped`.
+- **Warm-set repair.** Every sampling tick compares the configured warm models against `/api/ps` and re-warms any that were evicted (Metal OOM, a client's own `keep_alive`), rate-limited per model. Exposed as `ollama_guardian_warm_set_repairs_total`.
 - Exposes Prometheus metrics on a configurable network bind host and port.
 - Exposes a bearer-protected control API for restart, warmup, cooldown clearing, status, and recent logs.
 - Shows actionable recovery guidance instead of crashing when required runtime pieces are missing or misconfigured.

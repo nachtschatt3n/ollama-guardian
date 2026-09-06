@@ -407,6 +407,53 @@ private func testLogMonitorIgnoresGuardianPolling() throws {
     )
 }
 
+private func testWarmSetRepairFindsOnlyMissingModels() throws {
+    let warm = [
+        WarmModelConfig(name: "gemma4:26b-mlx", endpointType: .generate),
+        WarmModelConfig(name: "gemma4:e2b-mlx", endpointType: .generate),
+        WarmModelConfig(name: "nomic-embed-text:latest", endpointType: .embed),
+    ]
+
+    // The state after the Metal OOM on 2026-09-06 07:24: only the 26b came back.
+    let afterOOM = WarmSetRepair.missing(warmModels: warm, loaded: ["gemma4:26b-mlx"])
+    try expect(afterOOM.map(\.name) == ["gemma4:e2b-mlx", "nomic-embed-text:latest"],
+               "Should re-warm exactly the two evicted models, got \(afterOOM.map(\.name))")
+
+    // Healthy: nothing to do. `/api/ps` spells the embed model with `:latest`; a config
+    // without the suffix must still count as resident.
+    let healthy = WarmSetRepair.missing(
+        warmModels: warm + [WarmModelConfig(name: "nomic-embed-text", endpointType: .embed)],
+        loaded: ["gemma4:26b-mlx", "gemma4:e2b-mlx", "nomic-embed-text:latest"]
+    )
+    try expect(healthy.isEmpty, "A fully resident warm set needs no repair, got \(healthy.map(\.name))")
+
+    // Server just came up with nothing loaded: everything is due.
+    try expect(WarmSetRepair.missing(warmModels: warm, loaded: []).count == 3, "Empty /api/ps means all three are missing")
+
+    // Blank entries (an unfinished settings row) must never be sent to the API.
+    let blank = WarmSetRepair.missing(warmModels: [WarmModelConfig(name: "  ", endpointType: .generate)], loaded: [])
+    try expect(blank.isEmpty, "A blank warm-model name must be ignored")
+}
+
+private func testWarmSetRepairRateLimitsPerModel() throws {
+    let e2b = WarmModelConfig(name: "gemma4:e2b-mlx", endpointType: .generate)
+    let nomic = WarmModelConfig(name: "nomic-embed-text:latest", endpointType: .embed)
+    let t0 = Date()
+
+    let first = WarmSetRepair.due([e2b, nomic], lastAttempt: [:], now: t0)
+    try expect(first.models.count == 2, "First pass should attempt both")
+
+    // Ten seconds later, still missing: neither is due again yet.
+    let soon = WarmSetRepair.due([e2b, nomic], lastAttempt: first.updatedAttempts, now: t0.addingTimeInterval(10))
+    try expect(soon.models.isEmpty, "Within the minimum interval nothing should be retried")
+
+    // Past the interval for one model only.
+    var attempts = first.updatedAttempts
+    attempts["gemma4:e2b-mlx"] = t0.addingTimeInterval(-WarmSetRepair.minimumInterval)
+    let later = WarmSetRepair.due([e2b, nomic], lastAttempt: attempts, now: t0.addingTimeInterval(10))
+    try expect(later.models.map(\.name) == ["gemma4:e2b-mlx"], "Only the model past its interval is due, got \(later.models.map(\.name))")
+}
+
 private func testReaperFindsOrphanedRunnersOnly() throws {
     // Real shapes taken from `ps -Ao pid=,ppid=,command=` on the Mac mini.
     let psOutput = """
@@ -481,6 +528,8 @@ enum VerificationRunner {
             ("Log monitor counts minute-long requests", testLogMonitorCountsMinuteLongRequests),
             ("Reaper finds orphaned runners only", testReaperFindsOrphanedRunnersOnly),
             ("Reaper rejects serve and foreign binaries", testReaperRejectsServeAndForeignBinaries),
+            ("Warm set repair finds only missing models", testWarmSetRepairFindsOnlyMissingModels),
+            ("Warm set repair rate-limits per model", testWarmSetRepairRateLimitsPerModel),
         ]
 
         var failures: [String] = []

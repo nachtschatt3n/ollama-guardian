@@ -743,6 +743,22 @@ actor GuardianBackend {
         }
     }
 
+    /// Re-warms only the given models. One model failing to come back must not stop the
+    /// others, so errors are logged per model rather than thrown. Returns how many succeeded.
+    func repairWarmSet(missing: [WarmModelConfig], config: GuardianConfig) async -> Int {
+        var repaired = 0
+        for model in missing {
+            logger.write("warm set repair: \(model.name) is not resident, re-warming via \(model.endpointType.rawValue)")
+            do {
+                try await apiClient.warm(model: model, config: config)
+                repaired += 1
+            } catch {
+                logger.write("warm set repair: \(model.name) failed: \(error.localizedDescription)")
+            }
+        }
+        return repaired
+    }
+
     /// Keeps the two managed child-process logs from growing without bound. Cheap enough
     /// (a `stat` per file) to run on every sampling tick; the copy only happens past the limit.
     private func rotateManagedLogs(config: GuardianConfig) {
