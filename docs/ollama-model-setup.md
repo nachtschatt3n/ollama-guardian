@@ -10,7 +10,7 @@ Last reviewed 2026-09-05.
 | Model | Role | Format | Context | Vision | Speed | Consumers |
 |---|---|---|---|---|---|---|
 | **`gemma4:26b-mlx`** | big / quality / **vision** — the everything-model | MLX (26B-A4B) | **131k** (host env) | ✅ | 66–71 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
-| **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ❌ (no vision tensors at all) | 163–193 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog |
+| **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ✅ (since 0.33.3; verified 2026-09-16) | 163–193 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog, HA voice |
 | **`nomic-embed-text:latest`** | embeddings | — | — | — | 39 ms/doc | RAG: anythingllm, affine, nextcloud |
 
 Plus **`qwen3-tts`** (mlx-audio VoiceDesign, `:8000`) for TTS — OpenClaw voice notes, Open
@@ -49,8 +49,13 @@ the ARAG Android emulator are the usual pressure, not Ollama).
 > time: the discriminative image test below ran against `gemma4:26b-mlx` itself and failed
 > because the *runner* had no image path at all, not because the weights lacked one. They
 > did not: the build declares `vision_config: {model_type: gemma4_vision, hidden_size 1152,
-> 27 layers}`, readable from the registry without pulling 18 GB. `gemma4:e2b-mlx` genuinely
-> has no vision tensors and never will — do not generalise from it to the 26b.
+> 27 layers}`, readable from the registry without pulling 18 GB. **Correction 2026-09-16:** an
+> earlier version of this note claimed `gemma4:e2b-mlx` "has no vision tensors and never will".
+> That was wrong. Its registry config declares both `vision_config` and `audio_config`; the
+> `/api/show` check that produced the claim ran on 0.32.15 hours before the engine update, so it
+> reported the engine's gap as a model property. On 0.33.3 the e2b reads a five-digit number out
+> of the same test image in 6 s. The lesson stands, inverted: **check the registry config, not
+> `/api/show` on an old engine.**
 
 
 Migrating the big model to `gemma4:26b-mlx` was evaluated and **rejected**:
@@ -241,6 +246,9 @@ state is 1.53 s cold against the GGUF's 1.8 s.
 
 ### Traps this migration walked into
 
+- **`/api/show` capabilities reflect the engine, not the weights.** On 0.32.15 the e2b-mlx
+  reported no vision; the same digest on 0.33.3 reports vision and audio, and both work. A
+  capability "missing" on an old engine says nothing about the model.
 - **A model's config can live outside the manifest.** paperless-ngx stores it in the
   `paperless_applicationconfiguration` DB row, which *wins over* the pod env — Django reported
   `AI_ENABLED=False` while the DB said otherwise.
@@ -341,7 +349,7 @@ All 20 vision-capable models in the Ollama library, checked for an MLX variant t
 |---|---|---|
 | `qwen3.5` | 0.8b–35b | **no `tools`** capability |
 | `qwen3.6` | 27b, 35b | **no `tools`**, and dense |
-| `gemma4` | e2b–31b | **vision absent in the engine** (proven for e2b/26b; 31b untested) |
+| `gemma4` | e2b–31b | vision works on MLX since 0.33.3 (verified e2b, 26b); e4b/12b/31b configs declare it |
 | `qwen3.8` | 27b | dense — measured above |
 | `muse-glimmer` | 30b | dense (52 layers, no experts) — measured, slowest of the three |
 | all others | none | no MLX build at all |
