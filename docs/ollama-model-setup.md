@@ -3,7 +3,7 @@
 The local LLM setup this Guardian manages: **Ollama 0.33.3** on the Mac mini (Apple M4 Pro,
 48 GB unified memory), serving `192.168.30.111:11434` to the home-lab cluster. A separate
 mlx-audio Qwen3-TTS server runs at `:8000` (see [tts-voice-tuning.md](tts-voice-tuning.md)).
-Last reviewed 2026-09-05.
+Last reviewed 2026-09-17.
 
 ## Model roster (3 models, all kept warm)
 
@@ -22,9 +22,10 @@ much of the remaining 48 GB is free depends on what else the box is doing (agent
 the ARAG Android emulator are the usual pressure, not Ollama).
 
 ## Runtime tuning
-- **KV cache `q8_0` + flash attention** on the GGUF path (`gemma4:26b`, `nomic`) — halves
-  K-cache memory, fits 131k comfortably. (These are llama.cpp flags; they do **not** apply
-  to the MLX-engine `e2b-mlx`.)
+- **KV cache `q8_0` + flash attention** on the GGUF path — halves K-cache memory, fits 131k
+  comfortably. (These are llama.cpp flags; they do **not** apply to the MLX-engine models.)
+  Since 2026-09-17 the only warm model still on that path is `nomic`; the flags matter again
+  only if a GGUF 26b is ever deliberately loaded.
 - `OLLAMA_NUM_PARALLEL=2`, `OLLAMA_CONTEXT_LENGTH=65536`, `OLLAMA_MAX_LOADED_MODELS=3`,
   `OLLAMA_KEEP_ALIVE=-1` (Guardian injects these when it launches `ollama serve`).
 - **`OLLAMA_KEEP_ALIVE=-1` is a loaded footgun.** It pins *every* model anyone requests, not
@@ -197,9 +198,21 @@ llama-server model predicted to exceed available memory, evicting
 ```
 
 The GGUF reserves **27.1 GiB** — 18.6 of weights plus ~8.5 for its baked 131072 context times
-two parallel slots. The MLX build peaks at **18.7 GiB**. Together that is 45.8 of 48 GiB, so
+two parallel slots. The MLX build peaks at **18.7 GiB on a fresh load**, and settles at
+**26-27 GiB** in service once its 8 GiB prefix cache has filled (see the context section).
+Against the fresh figure that is 45.8 of 48 GiB, and against the working one it is worse, so
 whichever loads second evicts the first, and with `OLLAMA_KEEP_ALIVE=-1` both stay pinned and
 fight. A vision request in that state panics the MLX runner outright:
+
+> **Correction, measured 2026-09-17: the 18.7 GiB figure for the MLX build is wrong in steady
+> state — it actually peaks at ~26.2 GiB.** Across 2774 `peak memory` samples in the Guardian
+> log, 2582 are ≥ 20 GiB and the mode sits at 26.1–26.3 GiB; a small 414-token request still
+> peaked at 26.22 GiB, so this is not a long-prompt effect. That makes the coexistence
+> arithmetic far worse than written above: 27.1 + 26.2 = **53.3 GiB against 48**, i.e. the two
+> 26b builds do not merely crowd each other, they cannot both be resident even briefly. This is
+> why the OOM was instant and perfectly reproducible rather than marginal. The 18.7 GiB number
+> presumably came from a weights-only or smaller-context measurement and should not be used for
+> headroom planning. Current real headroom with the warm set: 26.2 + 6.4 + 0.4 ≈ **33 of 48 GiB**.
 
 ```
 panic: mlx: [METAL] Command buffer execution failed: Insufficient Memory
@@ -211,6 +224,36 @@ purely the two-resident condition. A migration must therefore switch *every* con
 swap the model once. A gradual rollout is guaranteed to thrash: during the split state on
 2026-09-04, real cluster requests returned 500 after `Request terminated error="context
 canceled"`, i.e. clients giving up mid-load.
+
+#### The migration was not actually complete until 2026-09-17 — `bank-refresh` was the holdout
+
+The 2026-09-04 switch was believed fleet-wide, but one consumer kept asking for the GGUF
+`gemma4:26b`: the `bank-refresh` menubar app on the mini (launchd
+`com.mathiasuhl.moneymoney.refresh`, `StartInterval` 7200). Every couple of hours it pulled the
+GGUF back in, which evicted *both* MLX runners, OOM-panicked the 26b-mlx, and made the Guardian
+re-pin the warm set — the exact thrash this section warns about, recurring for five days after
+the migration was thought finished.
+
+It is easy to miss because the evidence is indirect: the Guardian log shows only an eviction and
+an OOM, never the requesting client. The fingerprint that made it attributable:
+
+- `predicted_num_ctx=262144` in the eviction line is emitted **only** by the GGUF 26b (its baked
+  131072 context × 2 parallel slots). No MLX model can produce it.
+- Every one of the 18 episodes in the log sat on **HH:18**, exactly the launchd cadence.
+
+**Reading the log timestamps.** `time=` lines are local **CEST (+02:00)**; only the Guardian's
+own bracketed lines (`[...Z]`) are UTC. An hour spent chasing a phantom two-hour offset is
+avoidable by remembering this — `13:18:08+02:00` is the 11:18Z run.
+
+Fixed by pointing `OLLAMA_MODEL` at `gemma4:26b-mlx`. The effective switch is `.env` on the host
+(gitignored); the code and doc fallbacks are committed on `bank-refresh` `main` as `ca71db9` and
+`cef90be`. Verified on the 13:18Z run 2026-09-17: real inference (~1.3 s) served off the resident
+MLX runner, no model load, no eviction, `predicted_num_ctx=262144` count unchanged at 36, and the
+Guardian repair counter static at 148.
+
+**Lesson for the next migration:** "every consumer" has to include host-local launchd jobs and
+menubar apps, not just cluster manifests — a grep of `cberg-home-nextgen` would never have found
+this one.
 
 ### Measured: MLX serialises, llama.cpp batches
 
@@ -258,9 +301,37 @@ state is 1.53 s cold against the GGUF's 1.8 s.
 - **The consumer inventory under-counts.** `docs/ai-usage-map.md` in the cluster repo was
   missing `sure` — the single largest consumer — plus `hermes-agent` and `ha-ai-harness`.
 - **Nextcloud had four model keys**, not one.
+- **The inventory only looked at the cluster.** Every sweep — manifests, pod env, ConfigMaps,
+  PVC files, app databases — searched Kubernetes, and each one reported the migration complete.
+  The last consumer was `bank-refresh`, a launchd job and menubar app **on the mini itself**,
+  reaching the daemon over its own LAN IP so its requests logged as `192.168.30.111` and read
+  like the guardian's own traffic. It survived the migration by 13 days and caused every OOM
+  in that window: 18 GGUF loads, 15 eviction episodes, 230 HTTP 500. Ask "what runs on the
+  host?" as its own question — the cluster inventory cannot answer it.
 - **Any client sending its own `keep_alive` re-stamps the shared model's expiry.** Three Home
   Assistant scripts sent `"60m"`, which silently un-pinned warm models fleet-wide; the Guardian
   only pins at startup, so that persisted until the next restart.
+
+## The GGUF is gone (2026-09-17)
+
+`gemma4:26b` was removed from disk once its last consumer moved. Deleting it is the only
+enforcement that works: a request for a model that is not present returns
+`{"error":"model 'gemma4:26b' not found"}` immediately — no auto-pull (`OLLAMA_NO_CLOUD=1`,
+and the chat endpoints never pull), no 27 GiB load, no eviction of the warm set. Configuration
+alone could not cover the two human paths that remained, LibreChat's picker and Headlamp's
+per-browser localStorage.
+
+What this trades away: the `predicted_num_ctx=262144` line was the unambiguous fingerprint that
+identified every offender for two weeks. In exchange, an offender now identifies itself in the
+access log with a failed request and its source IP, at no cost to anyone else.
+
+Restoring it is `ollama pull gemma4:26b`, 18.6 GB, about four minutes. Worth doing only for a
+real MLX defect, not out of habit.
+
+Verified after the removal: `bank-refresh` ran at 13:18Z on the resident MLX model, 2 of 2
+categorised in **1.4 s** against 15.4 s for the same job two hours earlier, which had included a
+27 GiB load and an OOM. Across 931 new log lines: zero matches for any of the six failure
+signatures, and the guardian's repair counter held at 148.
 
 ## Candidate evaluations — is anything better than `gemma4:26b`?
 
