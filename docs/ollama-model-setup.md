@@ -361,6 +361,19 @@ the quality bar (`qwen3-vl` 6 GB, `minicpm-v4.6` 1.6 GB), or a specialist (`glm-
 → **`gemma4:26b` stays.** It is currently the only model in the library combining vision,
 tools and MoE at a size that fits this box.
 
+### Re-checked 2026-09-16 — no change, decided 2026-09-17
+
+- **Big slot:** `qwen3.8` is still 27B-only and dense (measured above). `qwen3.8-flash-next`
+  is the interesting one — 125B MoE with 6B active, Qwen4's architecture — but its smallest
+  MLX tag is **105 GB**. Does not fit in any role.
+- **Small slot:** `qwen3.5` now carries `tools` (it did not in August), with MLX tags at
+  0.8b/2b/4b/9b. `qwen3.5:4b-mlx` (4.0 GB, dense, vision) was the only candidate that would
+  not make the box worse; the 9B and `gemma4:e4b-mlx` (9.5 GB) each cost ~3 GiB on a host
+  already at 46 G used. Not tested: `gemma4:e2b-mlx` turned out to have vision and audio
+  after all (see correction above), so a swap would have to win on German voice quality and
+  HA tool-call reliability alone, and the decision was to keep what runs.
+- Roster unchanged: `gemma4:26b-mlx`, `gemma4:e2b-mlx`, `nomic-embed-text`.
+
 Idea parked: `glm-ocr` (2.2 GB) as a *complement* rather than a replacement, to take OCR load
 off the 26b if paperless-gpt ever becomes the bottleneck.
 
