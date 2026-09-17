@@ -308,9 +308,19 @@ state is 1.53 s cold against the GGUF's 1.8 s.
 
 ## The GGUF is gone (2026-09-17)
 
-`gemma4:26b` was removed from disk once its last consumer moved. Deleting it is the only
-enforcement that works: a request for a model that is not present returns
-`{"error":"model 'gemma4:26b' not found"}` immediately — no auto-pull (`OLLAMA_NO_CLOUD=1`,
+`gemma4:26b` was removed from disk once its last consumer moved, **at the user's explicit
+request** — blocking the residual GGUF requests was the stated goal, and deletion is what
+delivers it.
+
+**This action leaves no git trail, by nature.** Models do not live in the repo: the removal was
+a `DELETE /api/delete` at 15:04:45 CEST, and the commits around it are documentation only. A
+future reader who finds the tag gone and goes looking for the change in `git log` will not find
+it, and should not conclude it was unauthorised — that inference was actually drawn once, on
+2026-09-17, and cost two agents a round trip to undo. Host-state changes are recorded here or
+nowhere.
+
+Deleting it is the only enforcement that works: a request for a model that is not present
+returns `{"error":"model 'gemma4:26b' not found"}` immediately — no auto-pull (`OLLAMA_NO_CLOUD=1`,
 and the chat endpoints never pull), no 27 GiB load, no eviction of the warm set. Configuration
 alone could not cover the two human paths that remained, LibreChat's picker and Headlamp's
 per-browser localStorage.
