@@ -9,7 +9,7 @@ Last reviewed 2026-09-17.
 
 | Model | Role | Format | Context | Vision | Speed | Consumers |
 |---|---|---|---|---|---|---|
-| **`gemma4:26b-mlx`** | big / quality / **vision** — the everything-model | MLX (26B-A4B) | **131k** (host env) | ✅ | 66–71 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
+| **`gemma4:26b-mlx`** | big / quality / **vision** — the everything-model | MLX (26B-A4B) | **64k** (host env, per slot) | ✅ | 66–71 tok/s | ~15 cluster apps (chat, agents, OCR, vision) |
 | **`gemma4:e2b-mlx`** | small / edge / fast text | MLX nvfp4 (5.2B) | default | ✅ (since 0.33.3; verified 2026-09-16) | 163–193 tok/s | ha-ai-harness `EDGE_MODEL`, openclaw catalog, HA voice |
 | **`nomic-embed-text:latest`** | embeddings | — | — | — | 39 ms/doc | RAG: anythingllm, affine, nextcloud |
 
@@ -200,19 +200,13 @@ llama-server model predicted to exceed available memory, evicting
 The GGUF reserves **27.1 GiB** — 18.6 of weights plus ~8.5 for its baked 131072 context times
 two parallel slots. The MLX build peaks at **18.7 GiB on a fresh load**, and settles at
 **26-27 GiB** in service once its 8 GiB prefix cache has filled (see the context section).
-Against the fresh figure that is 45.8 of 48 GiB, and against the working one it is worse, so
-whichever loads second evicts the first, and with `OLLAMA_KEEP_ALIVE=-1` both stay pinned and
-fight. A vision request in that state panics the MLX runner outright:
-
-> **Correction, measured 2026-09-17: the 18.7 GiB figure for the MLX build is wrong in steady
-> state — it actually peaks at ~26.2 GiB.** Across 2774 `peak memory` samples in the Guardian
-> log, 2582 are ≥ 20 GiB and the mode sits at 26.1–26.3 GiB; a small 414-token request still
-> peaked at 26.22 GiB, so this is not a long-prompt effect. That makes the coexistence
-> arithmetic far worse than written above: 27.1 + 26.2 = **53.3 GiB against 48**, i.e. the two
-> 26b builds do not merely crowd each other, they cannot both be resident even briefly. This is
-> why the OOM was instant and perfectly reproducible rather than marginal. The 18.7 GiB number
-> presumably came from a weights-only or smaller-context measurement and should not be used for
-> headroom planning. Current real headroom with the warm set: 26.2 + 6.4 + 0.4 ≈ **33 of 48 GiB**.
+Measured 2026-09-17 over 2774 `peak memory` samples: 2582 are ≥ 20 GiB, the mode is 26.1–26.3
+GiB, and even a 414-token request peaked at 26.22 GiB — so the settled figure, not the fresh
+one, is what headroom planning must use. Current real headroom: 26.2 + 6.4 + 0.4 ≈ 33 of 48 GiB.
+Against the fresh figure that is 45.8 of 48 GiB; against the working one it is **53.3 against
+48**, i.e. once the MLX runner has warmed up the two builds cannot both be resident even
+briefly. So whichever loads second evicts the first, and with `OLLAMA_KEEP_ALIVE=-1` both stay
+pinned and fight. A vision request in that state panics the MLX runner outright:
 
 ```
 panic: mlx: [METAL] Command buffer execution failed: Insufficient Memory
@@ -332,6 +326,15 @@ Verified after the removal: `bank-refresh` ran at 13:18Z on the resident MLX mod
 categorised in **1.4 s** against 15.4 s for the same job two hours earlier, which had included a
 27 GiB load and an OOM. Across 931 new log lines: zero matches for any of the six failure
 signatures, and the guardian's repair counter held at 148.
+
+**Order of events matters when reading that evidence.** The removal landed 15:04:45 CEST and the
+run was 15:18 CEST, so "no `predicted_num_ctx=262144` after the run" is **overdetermined** — the
+tag was already gone, and no GGUF load could have happened whatever `bank-refresh` asked for. It
+is therefore not by itself proof that the `.env` switch took effect. What *does* prove it: the
+run **succeeded** (2/2 categorised) instead of returning `model 'gemma4:26b' not found`, and that
+error appears **zero** times in the log. Had the config change not taken, the deletion would have
+converted a silent OOM into a loud failure. Both changes were sound; they were just verified on
+the same run, and only one of the two signals discriminates between them.
 
 ## Candidate evaluations — is anything better than `gemma4:26b`?
 
@@ -546,5 +549,7 @@ name (verified across 3.83 M lines), so per-app attribution has to come from the
   exist — quit the Guardian, swap `/Applications/Ollama.app`, relaunch.
 - The Guardian is the single server on `:11434`; its watchdog restarts `ollama serve` on the
   current binary if it's stopped.
-- Cluster apps reference the model by tag `gemma4:26b` (unchanged) — no app changes were
-  needed for any of this.
+- ~~Cluster apps reference the model by tag `gemma4:26b` (unchanged) — no app changes were
+  needed for any of this.~~ **Void since 2026-09-04/09-17.** Consumers now reference
+  `gemma4:26b-mlx`, and as of 2026-09-17 the `gemma4:26b` tag no longer exists on disk, so
+  anything still pointing at it fails fast rather than silently thrashing the host.
